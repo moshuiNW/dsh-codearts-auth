@@ -1,4 +1,4 @@
-﻿import { Context } from '@deepseek-ai/cordis'
+import { Context } from '@deepseek-ai/cordis'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
 import Schema from '@deepseek-ai/schemastery'
 import type { BuddyCredential } from './buddy.js'
@@ -161,7 +161,7 @@ export class AccountPool {
   /** 更新账号部分字段 */
   async updateAccount(
     id: string,
-    patch: Partial<Pick<ProviderAccountEntry, 'nickname' | 'enabled' | 'expiresAt' | 'refreshable'>>,
+    patch: Partial<Pick<ProviderAccountEntry, 'nickname' | 'enabled' | 'expiresAt' | 'refreshable' | 'edition'>>,
   ): Promise<void> {
     const accounts = this.readAccounts()
     const idx = accounts.findIndex(a => a.id === id)
@@ -215,20 +215,63 @@ export class AccountPool {
     }
   }
 
+  /**
+   * 按凭据内容反查账号**条目**（含 credentialRef），供调用方刷新该账号自身。
+   *
+   * 与 {@link findAccountIdByCredential} 的区别：后者只返回 id，无法定位到
+   * 需要刷新写入的 credentialRef；而单凭据 ref（BUDDY_ACCESS_TOKEN）在纯
+   * 账号池部署下并不存在，必须知道池内该账号自己的 ref 才能续期。
+   */
+  async findAccountByCredential(
+    provider: string,
+    identity: string,
+  ): Promise<ProviderAccountEntry | undefined> {
+    if (identity.length === 0) return undefined
+    const identifierKey = provider === 'buddy' ? 'access_token' : 'access_key_id'
+    for (const entry of this.readAccounts()) {
+      if (entry.provider !== provider || !entry.enabled) continue
+      const resolved = await this.resolveCredentialByRef(entry.credentialRef)
+      if (resolved === undefined) continue
+      if (resolved[identifierKey] === identity) return entry
+    }
+    return undefined
+  }
+
+  /**
+   * 从凭据的 expires_at 解析毫秒时间戳。
+   * 兼容毫秒/秒级时间戳与 ISO 8601；无法解析返回 undefined（不判定为过期）。
+   */
+  private expiryOf(credential: Record<string, unknown>): number | undefined {
+    const value = credential.expires_at
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      return value > 1_000_000_000_000 ? value : value * 1000
+    }
+    if (typeof value !== 'string' || value.length === 0) return undefined
+    if (/^\d+$/.test(value)) {
+      const n = Number(value)
+      return n > 1_000_000_000_000 ? n : n * 1000
+    }
+    const parsed = Date.parse(value)
+    return Number.isNaN(parsed) ? undefined : parsed
+  }
+
   /** 获取指定 provider + 模型的下一个可用账号 */
   async getAvailableAccount(
     provider: string,
     modelId: string,
   ): Promise<{ entry: ProviderAccountEntry; credential: CodeArtsCredential | BuddyCredential } | null> {
+    const now = Date.now()
     const candidates = this.readAccounts()
       .filter(a => a.provider === provider && a.enabled)
       .filter(a => {
-        if (!a.modelRateLimits) return true
+        // modelId 为空时无法做限流过滤（历史调用方不知道模型）；
+        // 正确的调用方应传入真实模型 id，否则会选中已限流的账号。
+        if (modelId.length === 0 || !a.modelRateLimits) return true
         const resetAt = a.modelRateLimits[modelId]
-        return resetAt === undefined || resetAt === 0 || Date.now() >= resetAt
+        return resetAt === undefined || resetAt === 0 || now >= resetAt
       })
     if (candidates.length === 0) return null
-    // 优先选择无限制或限制最早到期的
+    // 排序优先级：无限制 > 限制最早到期。相同则保持原顺序（稳定）。
     candidates.sort((a, b) => {
       const ra = a.modelRateLimits?.[modelId] ?? 0
       const rb = b.modelRateLimits?.[modelId] ?? 0
@@ -236,6 +279,7 @@ export class AccountPool {
     })
     // 逐个尝试解析凭据，跳过占位/损坏条目（并记录原因，避免静默失败）
     const failures: string[] = []
+    let firstUsable: { entry: ProviderAccountEntry; credential: CodeArtsCredential | BuddyCredential } | undefined
     for (const entry of candidates) {
       let resolved
       try {
@@ -248,18 +292,33 @@ export class AccountPool {
         failures.push(`${entry.id}: 凭据未配置`)
         continue
       }
+      let credential: CodeArtsCredential | BuddyCredential
       try {
-        const credential = JSON.parse(resolved.value) as CodeArtsCredential | BuddyCredential
+        credential = JSON.parse(resolved.value) as CodeArtsCredential | BuddyCredential
+      } catch (error) {
+        failures.push(`${entry.id}: 凭据 JSON 损坏 (${String(error)})`)
+        continue
+      }
+      const usable = { entry, credential }
+      // 优先返回**未过期**的账号：凭据过期的账号需要先刷新，能避开就避开，
+      // 避免每轮请求都先撞一次过期再走刷新（refresh 只对单凭据 ref 有效，
+      // 纯账号池部署下会直接失败）。
+      if (firstUsable === undefined) firstUsable = usable
+      const expiresAt = this.expiryOf(credential as unknown as Record<string, unknown>)
+      if (expiresAt === undefined || now < expiresAt) {
         if (failures.length > 0) {
           this.ctx.logger?.warn?.(
             `[jet-hub] ${failures.length} 个 ${provider} 账号不可用，已跳过：${failures.join('; ')}`,
           )
         }
-        return { entry, credential }
-      } catch (error) {
-        failures.push(`${entry.id}: 凭据 JSON 损坏 (${String(error)})`)
-        continue
+        return usable
       }
+    }
+    if (firstUsable !== undefined) {
+      this.ctx.logger?.warn?.(
+        `[jet-hub] ${provider} 账号均已过期，回退到 ${firstUsable.entry.id}（等待刷新）`,
+      )
+      return firstUsable
     }
     if (failures.length > 0) {
       this.ctx.logger?.warn?.(

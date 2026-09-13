@@ -135,6 +135,8 @@ describe('BuddyAuth', () => {
       source: 'fake',
       expiresAt: expires,
       refreshable: true,
+      // 旧凭据无 edition 字段时归一化为国内站（cn）。
+      edition: 'cn',
     })
   })
 
@@ -280,5 +282,82 @@ describe('BuddyAuth silent refresh', () => {
       { id: 'glm-5.3', name: 'GLM-5.3' },
       { id: 'kimi-k3-1', name: 'Kimi K3-1' },
     ])
+  })
+})
+
+/**
+ * 纯账号池部署下的续期。
+ *
+ * 回归背景：`refresh()` 旧实现只操作单凭据 ref `BUDDY_ACCESS_TOKEN`，而
+ * Jet Hub 多账号部署下实际存的是 `BUDDY_ACCOUNT_*`，该 ref 并不存在——
+ * 于是池内 token 过期后刷新直接抛「未配置凭据，请先登录」，无法自愈。
+ * 修复后传入 pool 时优先刷新池内账号，并写回该账号**自己的** ref。
+ */
+describe('BuddyAuth 账号池续期', () => {
+  /** 只实现 refresh() 所需子集的账号池替身。 */
+  function makePool(overrides: {
+    available?: { entry: { id: string; credentialRef: string }; credential: BuddyCredential } | null
+  } = {}) {
+    const updates: Array<{ id: string; patch: Record<string, unknown> }> = []
+    return {
+      updates,
+      async getAvailableAccount() {
+        return overrides.available === undefined
+          ? { entry: { id: 'acct-1', credentialRef: 'BUDDY_ACCOUNT_A1' }, credential: makeCredential() }
+          : overrides.available
+      },
+      async updateAccount(id: string, patch: Record<string, unknown>) {
+        updates.push({ id, patch })
+      },
+    }
+  }
+
+  it('池内存在账号时刷新该账号自身的 ref（不依赖 BUDDY_ACCESS_TOKEN）', async () => {
+    const { ctx, credentials } = makeContext()
+    // 关键：只存池内 ref，不存 BUDDY_ACCESS_TOKEN
+    await credentials.set('BUDDY_ACCOUNT_A1', JSON.stringify(makeCredential({ access_token: 'POOL_AT' })))
+    const fetcher = refreshFetcher()
+    const service = newService(ctx, { fetcher })
+    const pool = makePool()
+
+    await service.refresh(pool as never)
+
+    // 池内账号的凭据被就地更新
+    const stored = JSON.parse((await credentials.resolve('BUDDY_ACCOUNT_A1'))!.value) as BuddyCredential
+    expect(stored.access_token).toBe('AT2')
+    expect(stored.refresh_token).toBe('RT2')
+    // 且刷新的是池内账号，而不是报"未配置凭据"
+    expect(pool.updates.some((u) => u.id === 'acct-1')).toBe(true)
+  })
+
+  it('池内无可用账号时回退到单凭据 ref', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set(BUDDY_CREDENTIAL_REF, JSON.stringify(makeCredential()))
+    const service = newService(ctx, { fetcher: refreshFetcher() })
+    await service.refresh(makePool({ available: null }) as never)
+    const stored = JSON.parse((await credentials.resolve(BUDDY_CREDENTIAL_REF))!.value) as BuddyCredential
+    expect(stored.access_token).toBe('AT2')
+  })
+
+  it('池内账号缺少 refresh_token 时回退到单凭据 ref', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set(BUDDY_CREDENTIAL_REF, JSON.stringify(makeCredential()))
+    const service = newService(ctx, { fetcher: refreshFetcher() })
+    const pool = makePool({
+      available: {
+        entry: { id: 'acct-1', credentialRef: 'BUDDY_ACCOUNT_A1' },
+        credential: makeCredential({ refresh_token: '' }),
+      },
+    })
+    await service.refresh(pool as never)
+    expect(JSON.parse((await credentials.resolve(BUDDY_CREDENTIAL_REF))!.value).access_token).toBe('AT2')
+  })
+
+  it('不传 pool 时保持原行为（操作单凭据 ref）', async () => {
+    const { ctx, credentials } = makeContext()
+    await credentials.set(BUDDY_CREDENTIAL_REF, JSON.stringify(makeCredential()))
+    const service = newService(ctx, { fetcher: refreshFetcher() })
+    await service.refresh()
+    expect(JSON.parse((await credentials.resolve(BUDDY_CREDENTIAL_REF))!.value).access_token).toBe('AT2')
   })
 })

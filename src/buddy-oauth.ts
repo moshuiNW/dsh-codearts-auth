@@ -9,8 +9,6 @@
  */
 
 import {
-  API_DOMAIN,
-  API_ENDPOINT,
   AUTH_REFRESH_SOURCE,
   AUTH_REFRESH_PATH,
   AUTH_STATE_PATH,
@@ -18,6 +16,7 @@ import {
   BUDDY_DEPLOYMENT_TYPE,
   BUDDY_PRODUCT_CODE,
   BUDDY_USER_AGENT,
+  buddySiteProfile,
   CODE_ACCOUNT_NOT_READY,
   CODE_TOKEN_NOT_READY,
   CONFIG_PATH,
@@ -31,8 +30,6 @@ import {
   HTTP_HEADER_PRODUCT_CODE,
   HTTP_HEADER_REFRESH_TOKEN,
   LOGIN_ACCOUNT_PATH,
-  LOGIN_TIMEOUT_MS,
-  PLATFORM,
   POLL_INTERVAL_MS,
   REQUEST_TIMEOUT_MS,
   STATE_REQUEST_TIMEOUT_MS,
@@ -45,7 +42,7 @@ import {
   parseModelsFromConfig,
   parseTokenData,
 } from './buddy.js'
-import type { BuddyAccount, BuddyCredential, BuddyRemoteModel, BuddyToken } from './buddy.js'
+import type { BuddyAccount, BuddyCredential, BuddyRemoteModel, BuddySiteProfile, BuddyToken } from './buddy.js'
 
 /** 在浏览器中打开登录 URL；永不抛出（失败时打印 URL 供手动打开）。 */
 export type OpenBrowser = (url: string) => void
@@ -68,12 +65,19 @@ export interface BuddyLoginFlowOptions {
   fetcher?: typeof fetch
   /** 在浏览器中打开登录 URL；默认使用平台打开器。 */
   openBrowser?: OpenBrowser
-  /** 轮询总超时（毫秒）；默认为 5 分钟。 */
+  /** 轮询总超时（毫秒）；默认为站点默认值（国内站 5 分钟 / 国际站 15 分钟）。 */
   timeoutMs?: number
   /** 轮询间隔（毫秒）；默认为 1 秒。 */
   pollIntervalMs?: number
   /** 已有的 auth state（跳过 fetchAuthState，直接使用此 state 轮询 token）。 */
   state?: string
+  /**
+   * 目标站点：`cn`（国内站，默认）| `intl`（国际站 www.workbuddy.ai）。
+   *
+   * 国际站无需微信扫码，但需要用户在浏览器内完成登录（邮箱/验证码/SSO），
+   * 因此等待窗口更长，auth/state 的 platform 参数为 workbuddy-ai。
+   */
+  edition?: string
 }
 
 /** 从 JSON 响应体读取错误码。 */
@@ -106,6 +110,22 @@ interface RequestOptions {
   signal?: AbortSignal
 }
 
+/**
+ * 按站点生成通用伪装头（Origin / Referer）。
+ *
+ * 上游各站的 Web 控制台来源不同：国内站为 www.codebuddy.cn，国际站为
+ * www.workbuddy.ai。对齐官方 Web 客户端补齐这两个头，降低被风控判为
+ * 异常客户端的概率（参考 workbuddy-gateway 的 commonHeaders）。
+ *
+ * 注意：仅设置 Origin/Referer，不覆盖调用方传入的鉴权与 UA 头。
+ */
+function siteHeaders(site: BuddySiteProfile): Record<string, string> {
+  return {
+    Origin: site.origin,
+    Referer: `${site.origin}/`,
+  }
+}
+
 /** 发起一次 CodeBuddy 控制面请求，返回 (status, body)。网络失败会抛出。 */
 async function request(
   method: 'GET' | 'POST',
@@ -132,15 +152,20 @@ async function request(
 }
 
 /**
- * POST /v2/plugin/auth/state?platform=ide → 获取 state + authUrl（无需认证）。
+ * POST /v2/plugin/auth/state?platform=... → 获取 state + authUrl（无需认证）。
+ *
+ * platform 参数按站点区分：国内站 `ide`，国际站 `workbuddy-ai`。
  */
 export async function fetchAuthState(
   fetcher: typeof fetch = fetch,
   signal?: AbortSignal,
+  edition?: unknown,
 ): Promise<{ state: string; authUrl: string }> {
-  const url = `${API_ENDPOINT}${AUTH_STATE_PATH}?platform=${PLATFORM}`
+  const site = buddySiteProfile(edition)
+  const url = `${site.base}${AUTH_STATE_PATH}?platform=${encodeURIComponent(site.platform)}`
   const headers: Record<string, string> = {
-    [HTTP_HEADER_DOMAIN]: API_DOMAIN,
+    ...siteHeaders(site),
+    [HTTP_HEADER_DOMAIN]: site.host,
     [HTTP_HEADER_NO_AUTHORIZATION]: 'true',
     [HTTP_HEADER_NO_USER_ID]: 'true',
     [HTTP_HEADER_NO_ENTERPRISE_ID]: 'true',
@@ -169,22 +194,26 @@ export async function fetchAuthState(
  * GET /v2/plugin/auth/token?state=... 轮询获取 token。
  *
  * 错误码 11217 = token 尚未就绪 → 继续轮询；网络错误同样继续轮询，
- * 不中断登录流程（对齐 Rust loop_get_token）。
+ * 不中断登录流程（对齐 Rust loop_get_token）。国际站等待授权期间同样返回
+ * 11217（与国内站一致），因此轮询逻辑无需分站点分支。
  */
 export async function loopGetToken(
   state: string,
-  options: { fetcher?: typeof fetch; timeoutMs?: number; pollIntervalMs?: number; signal?: AbortSignal } = {},
+  options: { fetcher?: typeof fetch; timeoutMs?: number; pollIntervalMs?: number; signal?: AbortSignal; edition?: unknown } = {},
 ): Promise<BuddyToken> {
   const fetcher = options.fetcher ?? fetch
-  const url = `${API_ENDPOINT}${AUTH_TOKEN_PATH}?state=${encodeURIComponent(state)}`
+  const site = buddySiteProfile(options.edition)
+  const url = `${site.base}${AUTH_TOKEN_PATH}?state=${encodeURIComponent(state)}`
   const headers: Record<string, string> = {
+    ...siteHeaders(site),
     [HTTP_HEADER_NO_AUTHORIZATION]: 'true',
     'User-Agent': BUDDY_USER_AGENT,
   }
-  const deadline = Date.now() + (options.timeoutMs ?? LOGIN_TIMEOUT_MS)
+  const timeoutMs = options.timeoutMs ?? site.loginTimeoutMs
+  const deadline = Date.now() + timeoutMs
   const interval = options.pollIntervalMs ?? POLL_INTERVAL_MS
   for (;;) {
-    if (Date.now() >= deadline) throw new Error('获取 token 超时（5 分钟）')
+    if (Date.now() >= deadline) throw new Error(`获取 token 超时（${Math.round(timeoutMs / 60000)} 分钟）`)
     if (options.signal?.aborted) throw new Error('登录已取消')
     await sleep(interval)
     let result: { status: number; body: unknown }
@@ -217,21 +246,24 @@ export async function loopGetToken(
 export async function getAccount(
   state: string,
   token: BuddyToken,
-  options: { fetcher?: typeof fetch; timeoutMs?: number; pollIntervalMs?: number; signal?: AbortSignal } = {},
+  options: { fetcher?: typeof fetch; timeoutMs?: number; pollIntervalMs?: number; signal?: AbortSignal; edition?: unknown } = {},
 ): Promise<BuddyAccount> {
   const fetcher = options.fetcher ?? fetch
-  const url = `${API_ENDPOINT}${LOGIN_ACCOUNT_PATH}?state=${encodeURIComponent(state)}`
+  const site = buddySiteProfile(options.edition)
+  const url = `${site.base}${LOGIN_ACCOUNT_PATH}?state=${encodeURIComponent(state)}`
   const headers: Record<string, string> = {
-    [HTTP_HEADER_DOMAIN]: token.domain,
+    ...siteHeaders(site),
+    [HTTP_HEADER_DOMAIN]: token.domain.length > 0 ? token.domain : site.host,
     Authorization: `Bearer ${token.accessToken}`,
     [HTTP_HEADER_NO_USER_ID]: 'true',
     [HTTP_HEADER_NO_ENTERPRISE_ID]: 'true',
     'User-Agent': BUDDY_USER_AGENT,
   }
-  const deadline = Date.now() + (options.timeoutMs ?? LOGIN_TIMEOUT_MS)
+  const timeoutMs = options.timeoutMs ?? site.loginTimeoutMs
+  const deadline = Date.now() + timeoutMs
   const interval = options.pollIntervalMs ?? POLL_INTERVAL_MS
   for (;;) {
-    if (Date.now() >= deadline) throw new Error('获取账户信息超时（5 分钟）')
+    if (Date.now() >= deadline) throw new Error(`获取账户信息超时（${Math.round(timeoutMs / 60000)} 分钟）`)
     if (options.signal?.aborted) throw new Error('登录已取消')
     await sleep(interval)
     let result: { status: number; body: unknown }
@@ -258,6 +290,9 @@ export async function getAccount(
  * POST /v2/plugin/auth/token/refresh 静默续期。
  *
  * 通过 X-Refresh-Token 头提交 refresh_token；成功时返回新令牌数据。
+ * 请求路由到**凭据自身 edition 所属站点**的上游——这是国内/国际站账号
+ * 能够混挂在同一账号池的前提。
+ *
  * refresh_token 被后端判定失效（401/403 或 message 含 expired/invalid）时抛
  * {@link RefreshTokenExpiredError}，调用方据此停止续期并提示重新登录。
  */
@@ -269,8 +304,10 @@ export async function refreshToken(
   if (!isRefreshable(credential)) {
     throw new RefreshTokenExpiredError('无 refresh_token，请重新登录')
   }
-  const url = `${API_ENDPOINT}${AUTH_REFRESH_PATH}`
+  const site = buddySiteProfile(credential.edition)
+  const url = `${site.base}${AUTH_REFRESH_PATH}`
   const headers: Record<string, string> = {
+    ...siteHeaders(site),
     ...credentialRequestHeaders(credential),
     Authorization: `Bearer ${credential.access_token}`,
     [HTTP_HEADER_REFRESH_TOKEN]: credential.refresh_token,
@@ -309,7 +346,7 @@ export class RefreshTokenExpiredError extends Error {
 /**
  * GET /v3/config → 获取远端模型列表（craft agent 的 models）。
  *
- * 失败时返回空数组（调用方回退到内置列表）。
+ * 按凭据所属站点路由；失败时返回空数组（调用方回退到内置列表）。
  */
 export async function fetchModels(
   credential: BuddyCredential,
@@ -317,8 +354,10 @@ export async function fetchModels(
   signal?: AbortSignal,
 ): Promise<BuddyRemoteModel[]> {
   if (credential.access_token.length === 0) return []
-  const url = `${API_ENDPOINT}${CONFIG_PATH}`
+  const site = buddySiteProfile(credential.edition)
+  const url = `${site.base}${CONFIG_PATH}`
   const headers: Record<string, string> = {
+    ...siteHeaders(site),
     ...credentialAuthHeaders(credential),
     [HTTP_HEADER_PRODUCT]: BUDDY_DEPLOYMENT_TYPE,
     [HTTP_HEADER_PRODUCT_CODE]: BUDDY_PRODUCT_CODE,
@@ -366,7 +405,7 @@ export async function runBuddyLoginFlow(options: BuddyLoginFlowOptions = {}): Pr
     state = options.state
     authUrl = ''
   } else {
-    const result = await fetchAuthState(fetcher)
+    const result = await fetchAuthState(fetcher, undefined, options.edition)
     state = result.state
     authUrl = result.authUrl
     await open(authUrl)
@@ -374,12 +413,13 @@ export async function runBuddyLoginFlow(options: BuddyLoginFlowOptions = {}): Pr
 
   const pollOptions = {
     fetcher,
+    edition: options.edition,
     ...options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {},
     ...options.pollIntervalMs !== undefined ? { pollIntervalMs: options.pollIntervalMs } : {},
   }
   const token = await loopGetToken(state, pollOptions)
   const account = await getAccount(state, token, pollOptions)
-  const credential = buildCredential(token, account)
+  const credential = buildCredential(token, account, options.edition)
   return {
     access: JSON.stringify(credential),
     // 对齐 Rust 的 expires_at_ms(...).unwrap_or(0)：无法解析时报告 0。

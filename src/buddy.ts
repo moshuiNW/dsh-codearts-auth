@@ -85,6 +85,87 @@ export const AUTH_REFRESH_SOURCE = 'ide-main'
 /** API 端点的裸域名（X-Domain 头的值）。 */
 export const API_DOMAIN = 'copilot.tencent.com'
 
+// ── 站点 Profile（国内站 / 国际站） ──
+//
+// 国际站 www.workbuddy.ai 与国内站 copilot.tencent.com 走**同一套** /v2/plugin/*
+// 与 /v2/chat/completions 协议（路径与响应包络完全一致），差异仅在：
+//   - 上游域名与 Web Origin（国际站位于腾讯 EdgeOne 国际 CDN）
+//   - auth/state 的 platform 参数（workbuddy-ai 而非 ide）
+//   - 登录在浏览器内完成（邮箱 / 验证码 / SSO），等待授权比扫码慢
+//   - 会话结构校验更严格：首条消息必须是 system（见 buddy-adapter 的归一化）
+// 站点标识随凭据持久化在 `edition` 字段，据此路由刷新与对话请求。
+
+/** 站点标识：`cn` = 国内站（copilot.tencent.com）；`intl` = 国际站（www.workbuddy.ai）。 */
+export type BuddyEdition = 'cn' | 'intl'
+
+/** 单个站点的上游参数。 */
+export interface BuddySiteProfile {
+  /** 站点标识（持久化到凭据的 edition 字段）。 */
+  key: BuddyEdition
+  /** 控制台/UI 展示名。 */
+  label: string
+  /** API 基础地址（无尾斜杠）。 */
+  base: string
+  /** 裸域名（X-Domain 头的兜底值）。 */
+  host: string
+  /** Origin / Referer 伪装来源（各站 Web 控制台）。 */
+  origin: string
+  /** auth/state 的 platform 参数。 */
+  platform: string
+  /** 登录命令等待授权完成的超时。 */
+  loginTimeoutMs: number
+}
+
+/** 国内站 copilot.tencent.com。 */
+export const BUDDY_SITE_CN: BuddySiteProfile = {
+  key: 'cn',
+  label: '国内站',
+  base: API_ENDPOINT,
+  host: API_DOMAIN,
+  origin: WEBSITE_HOME,
+  platform: PLATFORM,
+  loginTimeoutMs: LOGIN_TIMEOUT_MS,
+}
+
+/** 国际站 www.workbuddy.ai。 */
+export const BUDDY_SITE_INTL: BuddySiteProfile = {
+  key: 'intl',
+  label: '国际站',
+  base: 'https://www.workbuddy.ai',
+  host: 'www.workbuddy.ai',
+  origin: 'https://www.workbuddy.ai',
+  platform: 'workbuddy-ai',
+  // 浏览器内登录（邮箱/验证码/SSO）比扫码慢，放宽等待窗口。
+  loginTimeoutMs: 15 * 60 * 1000,
+}
+
+/**
+ * 归一化站点标识；空值/未知值回退国内站（与旧凭据兼容）。
+ * 接受别名 international / global / workbuddy.ai。
+ */
+export function normalizeBuddyEdition(value: unknown): BuddyEdition {
+  if (typeof value !== 'string') return 'cn'
+  switch (value.toLowerCase().trim()) {
+    case 'intl':
+    case 'international':
+    case 'global':
+    case 'workbuddy.ai':
+      return 'intl'
+    default:
+      return 'cn'
+  }
+}
+
+/** 取得站点 Profile；未知/空值回退国内站。 */
+export function buddySiteProfile(edition: unknown): BuddySiteProfile {
+  return normalizeBuddyEdition(edition) === 'intl' ? BUDDY_SITE_INTL : BUDDY_SITE_CN
+}
+
+/** chat/completions 的完整 URL（按凭据所属站点路由）。 */
+export function buddyChatUrl(edition: unknown): string {
+  return `${buddySiteProfile(edition).base}/v2/chat/completions`
+}
+
 // ── 凭据数据结构 ──
 
 /**
@@ -117,6 +198,13 @@ export interface BuddyCredential {
   enterprise_id?: string
   /** 账户类型（"personal" / "enterprise"）。 */
   account_type?: string
+  /**
+   * 站点标识：`cn`（国内站，默认）| `intl`（国际站 www.workbuddy.ai）。
+   *
+   * 缺失/未知值一律按国内站处理，因此旧凭据无需迁移即可继续使用。
+   * 刷新令牌、拉取模型与对话请求都据此路由到对应上游。
+   */
+  edition?: string
 }
 
 /** auth/token 与 auth/token/refresh 响应的令牌数据。 */
@@ -205,10 +293,25 @@ export function isRefreshable(credential: BuddyCredential): boolean {
   return credential.refresh_token.length > 0
 }
 
+/**
+ * 取生效的 X-Domain：凭据自带的 domain 优先，缺失或空串时回退站点域名。
+ *
+ * 必须按**长度**判断而非 `??`/`||` 混用：后端在部分响应里把 domain 返回为
+ * 空串，`'' ?? fallback` 仍得到 `''`，会让 X-Domain 变成非法空值。
+ */
+export function domainOrDefault(credential: BuddyCredential): string {
+  const domain = typeof credential.domain === 'string' ? credential.domain.trim() : ''
+  return domain.length > 0 ? domain : buddySiteProfile(credential.edition).host
+}
+
 /** 构造基础请求头（X-Domain + User-Agent + 可选企业头）。 */
 export function credentialRequestHeaders(credential: BuddyCredential): Record<string, string> {
   const headers: Record<string, string> = {
-    [HTTP_HEADER_DOMAIN]: credential.domain ?? API_DOMAIN,
+    // X-Domain 缺失时回退到凭据所属站点的域名（国际站是 workbuddy.ai，
+    // 不能一律回退 copilot.tencent.com，否则国际站账号会被判为跨站）。
+    // 注意用长度判断而非 `??`：后端会把 domain 返回为**空串**，
+    // `'' ?? x` 仍是 ''，会让 X-Domain 变成空值。
+    [HTTP_HEADER_DOMAIN]: domainOrDefault(credential),
     'User-Agent': BUDDY_USER_AGENT,
   }
   if (credential.enterprise_id !== undefined && credential.enterprise_id.length > 0) {
@@ -348,7 +451,11 @@ export function parseAccountData(data: unknown): BuddyAccount {
  * account.nickname → JWT.nickname → JWT.preferred_username。
  * 过期时间同理：token.expiresAt 为空时由 credentialExpiresAtMs 从 JWT exp 兜底。
  */
-export function buildCredential(token: BuddyToken, account: BuddyAccount): BuddyCredential {
+export function buildCredential(
+  token: BuddyToken,
+  account: BuddyAccount,
+  edition?: unknown,
+): BuddyCredential {
   const nickname = account.nickname.length > 0 ? account.nickname : jwtNickname(token.accessToken)
   return {
     access_token: token.accessToken,
@@ -362,6 +469,7 @@ export function buildCredential(token: BuddyToken, account: BuddyAccount): Buddy
     nickname,
     enterprise_id: account.enterpriseId,
     account_type: account.accountType,
+    edition: normalizeBuddyEdition(edition),
   }
 }
 

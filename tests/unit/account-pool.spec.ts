@@ -228,4 +228,90 @@ describe('AccountPool', () => {
     // 三条记录都必须留存（fix 前这里会是 [undefined, undefined, t3] 或类似）
     expect(limits).toEqual([t1, t2, t3])
   })
+
+  /**
+   * 限流避让与凭据过期处理。
+   *
+   * 回归背景：适配器此前用 `getAvailableAccount(provider, '')` 做**首次**选号
+   * （模型参数为空串），而限流过滤按 `modelRateLimits[modelId]` 查表——空串
+   * 恒为 undefined，于是已限流账号照样被选中，每个请求都要先撞一次 429 再
+   * 切换。修复后适配器透传真实模型 id，这里锁定该语义。
+   */
+  describe('限流避让与过期处理', () => {
+  it('传入真实模型时跳过该模型已限流的账号（首次选号）', async () => {
+    await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_T1'), JSON.stringify({ access_token: 'test1' }))
+    await pool.addAccount(makeMockAccount({ modelRateLimits: { 'hy4-preview': Date.now() + 3600_000 } }))
+    await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_T2'), JSON.stringify({ access_token: 'test2' }))
+    await pool.addAccount(makeMockAccount({ id: 'buddy-002', credentialRef: 'BUDDY_ACCOUNT_T2' }))
+
+    const picked = await pool.getAvailableAccount('buddy', 'hy4-preview')
+    expect(picked!.entry.id).toBe('buddy-002')
+    // 同一账号在**另一个**模型上并未限流，仍应可被选中
+    const other = await pool.getAvailableAccount('buddy', 'glm-5.3')
+    expect(other!.entry.id).toBe('buddy-001')
+  })
+
+  it('limit on one model does not block a different model', async () => {
+    await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_T1'), JSON.stringify({ access_token: 'test1' }))
+    await pool.addAccount(makeMockAccount({ modelRateLimits: { 'glm-5.3': Date.now() + 3600_000 } }))
+    expect((await pool.getAvailableAccount('buddy', 'glm-5.3'))).toBeNull()
+    expect((await pool.getAvailableAccount('buddy', 'hy4-preview'))!.entry.id).toBe('buddy-001')
+  })
+
+  /** 过期账号应让位给未过期的账号（避免每轮都先撞过期再走刷新）。 */
+  it('prefers a non-expired account over an expired one', async () => {
+    await ctx.credentials.set(
+      credentialRef('BUDDY_ACCOUNT_T1'),
+      JSON.stringify({ access_token: 'expired', expires_at: String(Date.now() - 60_000) }),
+    )
+    await pool.addAccount(makeMockAccount())
+    await ctx.credentials.set(
+      credentialRef('BUDDY_ACCOUNT_T2'),
+      JSON.stringify({ access_token: 'fresh', expires_at: String(Date.now() + 3600_000) }),
+    )
+    await pool.addAccount(makeMockAccount({ id: 'buddy-002', credentialRef: 'BUDDY_ACCOUNT_T2' }))
+
+    const picked = await pool.getAvailableAccount('buddy', 'm')
+    expect(picked!.entry.id).toBe('buddy-002')
+  })
+
+  /** 全部过期时仍返回一个账号（交由刷新），而不是判定"无可用账号"。 */
+  it('still returns an account when every account is expired', async () => {
+    await ctx.credentials.set(
+      credentialRef('BUDDY_ACCOUNT_T1'),
+      JSON.stringify({ access_token: 'expired', expires_at: String(Date.now() - 60_000) }),
+    )
+    await pool.addAccount(makeMockAccount())
+    const picked = await pool.getAvailableAccount('buddy', 'm')
+    expect(picked!.entry.id).toBe('buddy-001')
+  })
+
+  /** 无 expires_at（无法判定）不应被当作过期。 */
+  it('does not treat a credential without expires_at as expired', async () => {
+    await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_T1'), JSON.stringify({ access_token: 'no-expiry' }))
+    await pool.addAccount(makeMockAccount())
+    expect((await pool.getAvailableAccount('buddy', 'm'))!.entry.id).toBe('buddy-001')
+  })
+
+  /**
+   * findAccountByCredential 需要拿到 credentialRef —— 纯账号池部署下
+   * `BUDDY_ACCESS_TOKEN` 这个单凭据 ref 并不存在，刷新必须写回账号自己的 ref。
+   */
+  it('findAccountByCredential locates the pool entry (for per-account refresh)', async () => {
+    await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_T1'), JSON.stringify({ access_token: 'AT_X' }))
+    await pool.addAccount(makeMockAccount())
+    const found = await pool.findAccountByCredential('buddy', 'AT_X')
+    expect(found?.id).toBe('buddy-001')
+    expect(found?.credentialRef).toBe('BUDDY_ACCOUNT_T1')
+    // 未匹配到时不返回条目
+    expect(await pool.findAccountByCredential('buddy', 'nope')).toBeUndefined()
+    expect(await pool.findAccountByCredential('buddy', '')).toBeUndefined()
+  })
+
+  it('findAccountByCredential ignores disabled accounts', async () => {
+    await ctx.credentials.set(credentialRef('BUDDY_ACCOUNT_T1'), JSON.stringify({ access_token: 'AT_X' }))
+    await pool.addAccount(makeMockAccount({ enabled: false }))
+    expect(await pool.findAccountByCredential('buddy', 'AT_X')).toBeUndefined()
+  })
+  })
 })

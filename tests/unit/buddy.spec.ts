@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import {
   buildCredential,
+  buddyChatUrl,
+  buddySiteProfile,
   credentialAuthHeaders,
   credentialExpiresAtMs,
   credentialRequestHeaders,
   displayNameForModel,
   isExpired,
   isRefreshable,
+  normalizeBuddyEdition,
   parseAccountData,
   parseModelsFromConfig,
   parseTokenData,
@@ -272,5 +275,75 @@ describe('buddy model config parsing', () => {
   it('displayNameForModel falls back to the raw id', () => {
     expect(displayNameForModel('deepseek-v4-flash')).toBe('DeepSeek V4 Flash')
     expect(displayNameForModel('some-unknown-model')).toBe('some-unknown-model')
+  })
+})
+
+/**
+ * 国际站（www.workbuddy.ai）支持。
+ *
+ * 国际站与国内站共用一套 /v2/plugin/* 与 /v2/chat/completions 协议，
+ * 差异仅在域名、Origin 与 auth/state 的 platform 参数；站点标识持久化在
+ * 凭据的 `edition` 字段，据此路由刷新/对话请求。旧凭据无该字段时必须
+ * 回退国内站，否则升级后所有存量账号都会失效。
+ */
+describe('buddy 站点 profile', () => {
+  it('归一化站点标识，未知/空值回退国内站', () => {
+    expect(normalizeBuddyEdition('intl')).toBe('intl')
+    expect(normalizeBuddyEdition('INTL')).toBe('intl')
+    expect(normalizeBuddyEdition(' international ')).toBe('intl')
+    expect(normalizeBuddyEdition('global')).toBe('intl')
+    expect(normalizeBuddyEdition('workbuddy.ai')).toBe('intl')
+    // 旧凭据（无 edition）与未知值都必须回退国内站。
+    expect(normalizeBuddyEdition(undefined)).toBe('cn')
+    expect(normalizeBuddyEdition('')).toBe('cn')
+    expect(normalizeBuddyEdition('cn')).toBe('cn')
+    expect(normalizeBuddyEdition('nonsense')).toBe('cn')
+    expect(normalizeBuddyEdition(42)).toBe('cn')
+  })
+
+  it('国际站与国内站的域名/Origin/platform 各得其值', () => {
+    expect(buddySiteProfile('cn')).toMatchObject({
+      key: 'cn',
+      base: 'https://copilot.tencent.com',
+      host: 'copilot.tencent.com',
+      origin: 'https://www.codebuddy.cn',
+      platform: 'ide',
+      loginTimeoutMs: 5 * 60 * 1000,
+    })
+    expect(buddySiteProfile('intl')).toMatchObject({
+      key: 'intl',
+      base: 'https://www.workbuddy.ai',
+      host: 'www.workbuddy.ai',
+      origin: 'https://www.workbuddy.ai',
+      platform: 'workbuddy-ai',
+      // 浏览器内登录（邮箱/验证码/SSO）比扫码慢，等待窗口放宽到 15 分钟。
+      loginTimeoutMs: 15 * 60 * 1000,
+    })
+  })
+
+  it('buddyChatUrl 按站点路由 chat/completions', () => {
+    expect(buddyChatUrl('cn')).toBe('https://copilot.tencent.com/v2/chat/completions')
+    expect(buddyChatUrl('intl')).toBe('https://www.workbuddy.ai/v2/chat/completions')
+    expect(buddyChatUrl(undefined)).toBe('https://copilot.tencent.com/v2/chat/completions')
+  })
+
+  it('buildCredential 记录归一化后的站点标识', () => {
+    const token = parseTokenData({ accessToken: 'AT', refreshToken: 'RT' })
+    const account = parseAccountData({ uid: 'u1' })
+    expect(buildCredential(token, account, 'intl').edition).toBe('intl')
+    // 未指定站点时默认国内站，保证旧调用方行为不变。
+    expect(buildCredential(token, account).edition).toBe('cn')
+  })
+
+  it('X-Domain 缺失时按站点回退，而非一律回退国内站', () => {
+    const base = {
+      access_token: 'AT', refresh_token: 'RT', expires_at: '', refresh_expires_at: '',
+      token_type: 'Bearer', scope: '',
+    }
+    expect(credentialRequestHeaders({ ...base, edition: 'intl' })['X-Domain']).toBe('www.workbuddy.ai')
+    expect(credentialRequestHeaders({ ...base, edition: 'cn' })['X-Domain']).toBe('copilot.tencent.com')
+    // 凭据自带 domain 时以它为准（权威来源）。
+    expect(credentialRequestHeaders({ ...base, edition: 'intl', domain: 'custom.example' })['X-Domain'])
+      .toBe('custom.example')
   })
 })

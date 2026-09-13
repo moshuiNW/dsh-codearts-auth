@@ -6,6 +6,7 @@ import { registerCodeArtsLlm } from './llm-adapter.js'
 import { registerBuddyLlm } from './buddy-adapter.js'
 import { CODEARTS_CREDENTIAL_REF, CodeArtsAuth } from './service.js'
 import { BUDDY_CREDENTIAL_REF, BuddyAuth } from './buddy-auth.js'
+import { buddySiteProfile, normalizeBuddyEdition } from './buddy.js'
 import { AccountPool } from './account-pool.js'
 import { registerJetHubRpc } from './jet-hub-rpc.js'
 import type { CodeArtsCredential, BuddyCredential } from './types.js'
@@ -126,38 +127,52 @@ export function apply(ctx: Context): void {
       }
     },
   })
-  registerCodeArtsLlm(ctx, {
-    credentialRef: credentialRef(CODEARTS_CREDENTIAL_REF),
-    resolveCredential: async () => {
-      // 优先使用账号池获取可用账号，回退到单凭据解析
-      if (pool) {
-        const available = await pool.getAvailableAccount('codearts', '')
-        if (available) return available.credential as CodeArtsCredential
-      }
-      const resolved = await ctx.credentials.resolve(credentialRef(CODEARTS_CREDENTIAL_REF))
-      if (!resolved) return undefined
-      try {
-        return JSON.parse(resolved.value) as CodeArtsCredential
-      } catch {
-        return undefined
-      }
-    },
-    refresh: () => service.refresh(),
-    fetchRemoteModels: () => service.refreshModels(),
-    accountPool: pool,
-  })
+  // ===== 【已停用】CodeArts (华为云) LLM provider 注册 =====
+  //
+  // 停用原因：暂未配置华为云 CodeArts 账户，模型选择器中该 provider 无法使用。
+  // 停用范围：**仅** 不向模型选择器暴露 `codearts` provider。
+  //   - CodeArtsAuth 服务、/codearts-* 命令、AccountPool、JetHub RPC 全部保留；
+  //   - `codearts` 账号池仍可用，buddy 适配器依赖的 pool 不受影响。
+  //
+  // 恢复方式：取消下面整段注释即可（无需其他改动），然后 `pnpm build` + 刷新页面。
+  //
+  // registerCodeArtsLlm(ctx, {
+  //   credentialRef: credentialRef(CODEARTS_CREDENTIAL_REF),
+  //   resolveCredential: async () => {
+  //     // 优先使用账号池获取可用账号，回退到单凭据解析
+  //     if (pool) {
+  //       const available = await pool.getAvailableAccount('codearts', '')
+  //       if (available) return available.credential as CodeArtsCredential
+  //     }
+  //     const resolved = await ctx.credentials.resolve(credentialRef(CODEARTS_CREDENTIAL_REF))
+  //     if (!resolved) return undefined
+  //     try {
+  //       return JSON.parse(resolved.value) as CodeArtsCredential
+  //     } catch {
+  //       return undefined
+  //     }
+  //   },
+  //   refresh: () => service.refresh(),
+  //   fetchRemoteModels: () => service.refreshModels(),
+  //   accountPool: pool,
+  // })
+  // 引用保留仅为类型/导入完整性：恢复上面注释块时删掉本行即可。
+  void registerCodeArtsLlm
 
   // ===== Buddy (腾讯 CodeBuddy) 服务 =====
   const buddy = new BuddyAuth(ctx)
   ctx.commands.register({
     name: 'buddy-login',
-    description: '通过浏览器登录腾讯 CodeBuddy',
-    handler: async (): Promise<CommandResult> => {
+    description: '通过浏览器登录腾讯 CodeBuddy（附加 intl 参数则登录国际站 workbuddy.ai）',
+    handler: async (command): Promise<CommandResult> => {
+      // 站点选择：`/buddy-login intl` 登录国际站；默认国内站。
+      const edition = normalizeBuddyEdition(command?.rawInput)
+      const site = buddySiteProfile(edition)
       try {
-        const result = await buddy.login()
+        const result = await buddy.login({ edition })
         return {
           kind: 'success',
-          text: `CodeBuddy 登录完成。凭据已存储于 ${String(result.ref)}；`
+          text: `CodeBuddy（${site.label}）登录完成。凭据已存储于 ${String(result.ref)}；`
             + `${result.expires > 0 ? `过期时间 ${new Date(result.expires).toISOString()}` : '过期时间未知'}。`,
         }
       } catch (error) {
@@ -174,6 +189,7 @@ export function apply(ctx: Context): void {
         kind: 'success',
         text: [
           `已配置: ${status.configured}`,
+          ...status.edition === undefined ? [] : [`站点: ${buddySiteProfile(status.edition).label}`],
           ...status.source === undefined ? [] : [`来源: ${status.source}`],
           ...status.expiresAt === undefined ? [] : [`过期时间: ${new Date(status.expiresAt).toISOString()}`],
           `可刷新: ${status.refreshable}`,
@@ -200,10 +216,12 @@ export function apply(ctx: Context): void {
   })
   registerBuddyLlm(ctx, {
     credentialRef: credentialRef(BUDDY_CREDENTIAL_REF),
-    resolveCredential: async () => {
-      // 优先使用账号池获取可用账号，回退到单凭据解析
+    resolveCredential: async (model?: string) => {
+      // 优先使用账号池获取可用账号，回退到单凭据解析。
+      // 必须把 model 透传下去：账号池据此跳过**该模型已限流**的账号，
+      // 否则每个请求都会先选中已限流账号、白吃一次 429 再切换。
       if (pool) {
-        const available = await pool.getAvailableAccount('buddy', '')
+        const available = await pool.getAvailableAccount('buddy', model ?? '')
         if (available) return available.credential as BuddyCredential
       }
       const resolved = await ctx.credentials.resolve(credentialRef(BUDDY_CREDENTIAL_REF))
@@ -214,7 +232,9 @@ export function apply(ctx: Context): void {
         return undefined
       }
     },
-    refresh: () => buddy.refresh(),
+    // 续期：优先刷新**当前凭据所属的那个池内账号**（纯账号池部署下
+    // BUDDY_ACCESS_TOKEN 并不存在），失败再回退到单凭据刷新。
+    refresh: () => buddy.refresh(pool),
     fetchRemoteModels: () => buddy.fetchModels(pool),
     // 图片附件：桥接 ctx.attachments，把持久化图片读成原始字节供适配器内联。
     // 用 ctx.get 而非 inject —— 附件服务缺失时 provider 仍可正常加载，

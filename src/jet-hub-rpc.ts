@@ -13,7 +13,7 @@ import { AccountPool } from './account-pool.js'
 import type { CodeArtsAuth } from './service.js'
 import type { BuddyAuth } from './buddy-auth.js'
 import { fetchAuthState, runBuddyLoginFlow } from './buddy-oauth.js'
-import { credentialExpiresAtMs } from './buddy.js'
+import { credentialExpiresAtMs, normalizeBuddyEdition } from './buddy.js'
 import type { BuddyCredential } from './buddy.js'
 import type {
   RpcListAccountsRequest,
@@ -128,6 +128,8 @@ export function registerJetHubRpc(
       case 'account.create': {
         const req = payload as RpcCreateAccountRequest
         const { provider } = req
+        // 站点归属（仅 buddy 有意义）：缺失/未知值归一化为国内站。
+        const edition = normalizeBuddyEdition(req.edition)
         const id = `${provider}-${shortId()}`
         const suffix = shortId().toUpperCase()
         const refName = `${provider.toUpperCase()}_ACCOUNT_${suffix}`
@@ -138,7 +140,7 @@ export function registerJetHubRpc(
           let state: string
           let authUrl: string
           try {
-            const authState = await fetchAuthState()
+            const authState = await fetchAuthState(undefined, undefined, edition)
             state = authState.state
             authUrl = authState.authUrl
           } catch (error) {
@@ -155,9 +157,10 @@ export function registerJetHubRpc(
             credentialRef: refName,
             refreshable: false,
             createdAt: Date.now(),
+            edition,
           })
-          // 后台异步执行完整登录流程，使用同一个 state
-          runBuddyLoginFlow({ openBrowser: () => {}, state }).then(async (flow) => {
+          // 后台异步执行完整登录流程，使用同一个 state 与站点
+          runBuddyLoginFlow({ openBrowser: () => {}, state, edition }).then(async (flow) => {
             await ctx.credentials.set(ref, flow.access)
             buddy.scheduleRefresh()
             const credential = parseBuddyCredential(flow.access)
@@ -167,6 +170,7 @@ export function registerJetHubRpc(
               // 必须用 credentialExpiresAtMs 解析（Date.parse 对纯数字串会得到 NaN）。
               expiresAt: credential ? credentialExpiresAtMs(credential) : undefined,
               refreshable: Boolean(credential?.refresh_token),
+              edition: credential?.edition ?? edition,
             })
           }).catch((err) => {
             ctx.logger.warn(`[jet-hub] background buddy login failed for ${id}: ${err}`)

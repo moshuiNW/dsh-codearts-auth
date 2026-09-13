@@ -10,6 +10,18 @@ const PROVIDERS = Object.freeze([
   { id: 'buddy', label: 'CodeBuddy (腾讯)', icon: CODEBUDDY_ICON, logoClass: 'buddy' },
 ]);
 
+// buddy 的站点选项：国内站走微信扫码，国际站需在浏览器内完成登录（邮箱/验证码/SSO）。
+// 站点随凭据持久化，刷新与对话请求会自动路由到对应上游，因此两者可混挂在同一账号池。
+const BUDDY_EDITIONS = Object.freeze([
+  { id: 'cn', label: '国内站', hint: 'copilot.tencent.com · 微信/企业微信扫码' },
+  { id: 'intl', label: '国际站', hint: 'workbuddy.ai · 浏览器内登录（邮箱/验证码/SSO）' },
+]);
+
+const EDITION_LABELS = Object.freeze({
+  cn: '国内站',
+  intl: '国际站',
+});
+
 function ProviderLogo({ provider }) {
   const p = PROVIDERS.find(p => p.id === provider);
   if (!p) return null;
@@ -34,6 +46,10 @@ function AccountCard({ account, onToggle, onDelete }) {
     ? Object.entries(account.modelRateLimits).filter(([, v]) => v > Date.now())
     : [];
   const expired = typeof account.expiresAt === 'number' && account.expiresAt > 0 && account.expiresAt <= Date.now();
+  // 站点标签只对 buddy 展示（codearts 无站点概念）。国内站是默认值，为减少噪音不展示。
+  const editionLabel = account.provider === 'buddy' && account.edition === 'intl'
+    ? EDITION_LABELS[account.edition]
+    : null;
 
   return React.createElement('div', {
     className: 'dim-jh-accountCard',
@@ -48,6 +64,13 @@ function AccountCard({ account, onToggle, onDelete }) {
       }),
       React.createElement('span', { className: 'dim-jh-accountName' },
         account.nickname || account.id),
+      editionLabel
+        ? React.createElement('span', {
+            className: 'dim-jh-accountTag',
+            'data-tone': 'site',
+            title: '凭据所属站点',
+          }, editionLabel)
+        : null,
       React.createElement('span', {
         className: 'dim-jh-accountTag',
         'data-tone': account.enabled ? 'on' : 'off',
@@ -89,6 +112,8 @@ function ProviderPanel({ provider, rpcCall }) {
   const [phase, setPhase] = React.useState('loading');
   const [error, setError] = React.useState(null);
   const [creating, setCreating] = React.useState(false);
+  // 仅 buddy 需要选择站点；codearts 恒为国内站点。
+  const [edition, setEdition] = React.useState('cn');
   const mounted = React.useRef(true);
 
   const loadAccounts = React.useCallback(async () => {
@@ -117,8 +142,10 @@ function ProviderPanel({ provider, rpcCall }) {
     let accountId = '';
     let loginUrl = '';
     try {
-      console.log('[jet-hub] account.create request, provider =', provider);
-      const res = await rpcCall('account.create', { provider });
+      // 站点随请求下发；国际站登录在浏览器内完成，等待窗口更长。
+      const payload = provider === 'buddy' ? { provider, edition } : { provider };
+      console.log('[jet-hub] account.create request, provider =', provider, payload);
+      const res = await rpcCall('account.create', payload);
       console.log('[jet-hub] account.create response =', res);
       accountId = res.accountId;
       loginUrl = res.loginUrl;
@@ -173,16 +200,37 @@ function ProviderPanel({ provider, rpcCall }) {
     }
   };
 
+  const isBuddy = provider === 'buddy';
+  const activeEdition = BUDDY_EDITIONS.find(e => e.id === edition) || BUDDY_EDITIONS[0];
+
   return React.createElement('section', { 'aria-label': `${provider} 账号管理` },
     React.createElement('div', { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 } },
       React.createElement('h2', { style: { margin: 0, fontSize: 16, fontWeight: 600 } },
         `${PROVIDERS.find(p => p.id === provider)?.label || provider} 账号管理`),
-      React.createElement('button', {
-        className: 'dim-jh-btn',
-        'data-kind': 'primary',
-        onClick: () => void createAccount(),
-        disabled: creating,
-      }, creating ? '正在登录…' : '+ 新建账号')),
+      React.createElement('div', { style: { display: 'flex', alignItems: 'center', gap: 8 } },
+        isBuddy
+          ? React.createElement('div', { className: 'dim-jh-editionPicker', role: 'group', 'aria-label': '站点选择' },
+              BUDDY_EDITIONS.map(e => React.createElement('button', {
+                key: e.id,
+                type: 'button',
+                className: 'dim-jh-btn',
+                'data-kind': e.id === edition ? 'primary' : undefined,
+                'aria-pressed': e.id === edition,
+                title: e.hint,
+                onClick: () => setEdition(e.id),
+                disabled: creating,
+              }, e.label)))
+          : null,
+        React.createElement('button', {
+          className: 'dim-jh-btn',
+          'data-kind': 'primary',
+          onClick: () => void createAccount(),
+          disabled: creating,
+        }, creating ? '正在登录…' : '+ 新建账号'))),
+    isBuddy
+      ? React.createElement('p', { className: 'dim-jh-editionHint' },
+          `当前站点：${activeEdition.label} · ${activeEdition.hint}`)
+      : null,
     phase === 'loading'
       ? React.createElement('div', { className: 'dim-jh-empty' }, '正在读取账号列表…')
       : phase === 'error'

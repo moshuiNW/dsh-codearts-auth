@@ -20,10 +20,11 @@ import { isRateLimited, parseRateLimitError } from './llm-adapter.js'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
-  API_DOMAIN,
   BUDDY_DEPLOYMENT_TYPE,
   BUDDY_PRODUCT_CODE,
   BUDDY_USER_AGENT,
+  buddySiteProfile,
+  domainOrDefault,
   HTTP_HEADER_DOMAIN,
   HTTP_HEADER_PRODUCT,
   HTTP_HEADER_PRODUCT_CODE,
@@ -32,6 +33,13 @@ import {
 import type { BuddyCredential, BuddyRemoteModel } from './buddy.js'
 import { isTruncatedArguments, normalizeToolArguments, readWithIdleTimeout, resolveToolPairing } from './sse.js'
 
+/**
+ * 国内站 chat API 基础地址（**仅作兼容保留**）。
+ *
+ * 实际请求地址按凭据的 `edition` 动态解析：国内站为该值，国际站为
+ * `https://www.workbuddy.ai/v2`（见 buddy.ts 的 {@link buddySiteProfile}）。
+ * 请勿用它拼接请求 URL——那会把国际站账号误发到国内站上游。
+ */
 export const CHAT_API_BASE = 'https://copilot.tencent.com/v2'
 export const PROVIDER = 'buddy'
 
@@ -138,8 +146,13 @@ export interface BuddyAdapterOptions {
   credentialRef: CredentialRef
   /** 前缀缓存会话标识（prompt_cache_key）；未提供时随机生成一个。 */
   sessionId?: string
-  /** 从凭据存储解析凭据。 */
-  resolveCredential: () => Promise<BuddyCredential | undefined>
+  /**
+   * 从凭据存储解析凭据。
+   *
+   * `model` 为本次请求的模型 id：多账号池据此**跳过该模型已限流的账号**。
+   * 不传模型时无法做限流过滤（历史行为），仅用于无模型上下文的场景。
+   */
+  resolveCredential: (model?: string) => Promise<BuddyCredential | undefined>
   /** 静默续期凭据。 */
   refresh: () => Promise<void>
   /** 动态拉取远端模型列表（含上下文窗口与能力，若远端下发）；失败时调用方回退到静态列表。 */
@@ -255,6 +268,38 @@ function serializeMessages(
   }
   return wire
 }
+
+/**
+ * 保证首条消息为 `system`（腾讯上游的会话结构硬性校验）。
+ *
+ * 上游要求 messages[0].role === 'system'，否则返回 HTTP 400
+ * `{"code":11128,"msg":"first message is not system prompt"}`。
+ * **国际站（workbuddy.ai）严格校验**，国内站相对宽容——账号池混挂国内/国际
+ * 账号时，同一份会话历史会表现为"约一半请求随机失败"，极难排查。
+ *
+ * harness 正常会下发 system，但以下情况会产生非 system 开头：
+ * 用户关闭了系统提示词、以工具结果续写会话、或历史被裁剪掉首条消息。
+ * 此处按以下优先级归一化（对齐 workbuddy-gateway 的 ensureLeadingSystemMessage）：
+ *   1. 首条已是 system：原样返回；
+ *   2. 后续存在 system：提升到首位，其余保持原序；
+ *   3. 都没有：注入一条保底 system。
+ */
+function ensureLeadingSystemMessage(
+  messages: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  const roleOf = (message: Record<string, unknown>): string =>
+    typeof message.role === 'string' ? message.role.toLowerCase().trim() : ''
+
+  if (messages.length > 0 && roleOf(messages[0]) === 'system') return messages
+  const index = messages.findIndex((message) => roleOf(message) === 'system')
+  if (index > 0) {
+    return [messages[index], ...messages.slice(0, index), ...messages.slice(index + 1)]
+  }
+  return [{ role: 'system', content: DEFAULT_SYSTEM_PROMPT }, ...messages]
+}
+
+/** 缺少 system 提示词时注入的保底内容（对齐 workbuddy-gateway）。 */
+const DEFAULT_SYSTEM_PROMPT = 'You are a helpful assistant.'
 
 /** 安全读取 Error.message。 */
 function errorMessage(error: unknown): string {
@@ -510,11 +555,12 @@ export class BuddyAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    // 1. 获取凭据（过期则先静默续期）
-    let credential = await this.options.resolveCredential()
+    // 1. 获取凭据（过期则先静默续期）。
+    // 传入模型 id：账号池据此跳过该模型已限流的账号。
+    let credential = await this.options.resolveCredential(options.model)
     if (credential === undefined || isCredentialExpired(credential)) {
       await this.options.refresh()
-      credential = await this.options.resolveCredential()
+      credential = await this.options.resolveCredential(options.model)
     }
     if (credential === undefined || credential.access_token.length === 0) {
       throw new LlmError('buddy: no usable credential; log in first with /buddy-login', 'MISSING_CREDENTIAL')
@@ -569,6 +615,8 @@ export class BuddyAdapter extends LlmAdapter {
     if (options.system !== undefined && options.system.length > 0) {
       messages.unshift({ role: 'system', content: options.system })
     }
+    // 上游（尤其国际站）硬性要求首条消息为 system，否则 400 code=11128。
+    const normalizedMessages = ensureLeadingSystemMessage(messages)
     const tools = options.tools?.map((tool) => ({
       type: 'function' as const,
       function: {
@@ -581,7 +629,7 @@ export class BuddyAdapter extends LlmAdapter {
     // 3. 构造请求体
     const bodyObj: Record<string, unknown> = {
       model: options.model,
-      messages,
+      messages: normalizedMessages,
       stream: true,
       // prompt_cache_key 让服务端启用前缀缓存并在 usage 中返回缓存命中，
       // 缺少该字段时命中恒为 0（与 codearts 同款修复，见 llm-adapter.ts）。
@@ -606,7 +654,7 @@ export class BuddyAdapter extends LlmAdapter {
     let response = await this.send(credential, body, options)
     if (!response.ok && (response.status === 401 || response.status === 403)) {
       await this.options.refresh()
-      credential = await this.options.resolveCredential()
+      credential = await this.options.resolveCredential(options.model)
       if (credential === undefined || credential.access_token.length === 0) {
         throw new LlmError('buddy: credential expired and refresh failed', 'AUTH', { status: response.status })
       }
@@ -618,21 +666,24 @@ export class BuddyAdapter extends LlmAdapter {
       // 其余可用账号。每个失败账号都会被记录，只有真正试完全部候选才报
       // "所有账号均受限"——避免只试一个就下结论（那会让 UI 显示的限流
       // 状态与实际判定不一致）。
-      if (this.options.accountPool && isRateLimited(errorText)) {
+      //
+      // 判定必须带上 HTTP 状态码：上游（尤其国际站/CDN 边缘）可能返回 429
+      // 但响应体为空或只有一句 Too Many Requests，仅靠文本会漏判。
+      if (this.options.accountPool && isRateLimited(errorText, response.status)) {
+        const pool = this.options.accountPool
         const tried = new Set<string>()
         if (currentAccountId) tried.add(currentAccountId)
 
         for (;;) {
-          const parsed = parseRateLimitError(errorText, options.model)
-          if (!parsed) break
-          // 记录当前账号在该模型上的限流重置时间（UI 据此展示限流标记）
-          if (currentAccountId) {
-            await this.options.accountPool.updateModelRateLimit(
-              currentAccountId, parsed.modelId, parsed.resetTimeMs,
-            )
+          // 解析不出具体时刻时仍返回默认冷却（parseRateLimitError 保证），
+          // 因此这里拿到的 resetTimeMs 一定可用，不会因解析失败而放弃切换。
+          const parsed = parseRateLimitError(errorText, options.model, { status: response.status })
+          if (parsed && currentAccountId) {
+            // 记录当前账号在该模型上的限流重置时间（UI 据此展示限流标记）
+            await pool.updateModelRateLimit(currentAccountId, parsed.modelId, parsed.resetTimeMs)
           }
           // 取下一个未尝试过的可用账号
-          const next = await this.options.accountPool.getAvailableAccount('buddy', options.model)
+          const next = await pool.getAvailableAccount('buddy', options.model)
           if (!next || tried.has(next.entry.id)) break
           tried.add(next.entry.id)
           credential = next.credential as BuddyCredential
@@ -643,7 +694,7 @@ export class BuddyAdapter extends LlmAdapter {
             return
           }
           errorText = await response.text().catch(() => '')
-          if (!isRateLimited(errorText)) {
+          if (!isRateLimited(errorText, response.status)) {
             // 新账号失败但不是限流：按原错误分类抛出，不要再吞成"均受限"
             throw new LlmError(`buddy: ${errorDetail(errorText)}`, httpErrorCode(response.status), { status: response.status })
           }
@@ -663,17 +714,23 @@ export class BuddyAdapter extends LlmAdapter {
     body: string,
     options: GenerateOptions,
   ): Promise<Response> {
+    const site = buddySiteProfile(credential.edition)
     const headers = new Headers(attributionHeaders())
     headers.set('Authorization', `Bearer ${credential.access_token}`)
     headers.set('Accept', 'text/event-stream')
     headers.set('Content-Type', 'application/json')
-    headers.set(HTTP_HEADER_DOMAIN, credential.domain ?? API_DOMAIN)
+    // X-Domain 缺失时回退到凭据所属站点的域名：国际站账号发到国际站上游，
+    // 不能用国内站域名（会被判为跨站而拒绝）。空串同样按缺失处理。
+    headers.set(HTTP_HEADER_DOMAIN, domainOrDefault(credential))
     headers.set(HTTP_HEADER_PRODUCT, BUDDY_DEPLOYMENT_TYPE)
     headers.set(HTTP_HEADER_PRODUCT_CODE, BUDDY_PRODUCT_CODE)
+    // Origin/Referer 伪装为各站 Web 控制台（国际站为 workbuddy.ai）。
+    headers.set('Origin', site.origin)
+    headers.set('Referer', `${site.origin}/`)
     // User-Agent 必须伪装为 CodeBuddy IDE（后端以此识别客户端）。
     headers.set('User-Agent', BUDDY_USER_AGENT)
     try {
-      return await this.fetchImpl(`${CHAT_API_BASE}/chat/completions`, {
+      return await this.fetchImpl(`${site.base}/v2/chat/completions`, {
         method: 'POST',
         headers,
         body,

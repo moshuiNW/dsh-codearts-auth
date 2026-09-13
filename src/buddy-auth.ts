@@ -11,6 +11,7 @@ import {
   credentialExpiresAtMs,
   isExpired,
   isRefreshable,
+  normalizeBuddyEdition,
 } from './buddy.js'
 import {
   RefreshTokenExpiredError,
@@ -49,6 +50,8 @@ export interface BuddyLoginStatus {
   refreshable: boolean
   /** 最近一次刷新失败的原因（如有）。 */
   refreshError?: string
+  /** 当前凭据所属站点：`cn`（国内站）| `intl`（国际站）。 */
+  edition?: string
 }
 
 declare module '@deepseek-ai/cordis' {
@@ -122,6 +125,8 @@ export class BuddyAuth extends Service {
         createdAt: Date.now(),
         expiresAt: credential ? credentialExpiresAtMs(credential) : undefined,
         refreshable: Boolean(credential) && isRefreshable(credential!),
+        // 记录站点归属（cn/intl），供账号列表展示与刷新路由核对。
+        ...credential?.edition !== undefined ? { edition: credential.edition } : {},
       })
     }
     return {
@@ -150,6 +155,7 @@ export class BuddyAuth extends Service {
         nickname: credential?.nickname ?? accountId,
         expiresAt: credential ? credentialExpiresAtMs(credential) : undefined,
         refreshable: Boolean(credential) && isRefreshable(credential!),
+        ...credential?.edition !== undefined ? { edition: credential.edition } : {},
       })
     }
   }
@@ -161,12 +167,14 @@ export class BuddyAuth extends Service {
     if (!info.configured) return { configured: false, refreshable: false }
     let expiresAt: number | undefined
     let refreshable = false
+    let edition: string | undefined
     const resolved = await this.ctx.credentials.resolve(ref)
     if (resolved) {
       const credential = parseCredential(resolved.value)
       if (credential) {
         expiresAt = credentialExpiresAtMs(credential)
         refreshable = isRefreshable(credential) && !this.refreshTokenInvalid
+        edition = normalizeBuddyEdition(credential.edition)
       }
     }
     return {
@@ -174,12 +182,26 @@ export class BuddyAuth extends Service {
       source: info.source,
       expiresAt,
       refreshable,
+      ...edition === undefined ? {} : { edition },
       ...this.lastRefreshError === undefined ? {} : { refreshError: this.lastRefreshError },
     }
   }
 
-  /** 静默续期：refresh_token 换取；无 refresh_token 时明确报错（由命令提示重新登录）。 */
-  async refresh(): Promise<void> {
+  /**
+   * 静默续期。
+   *
+   * 优先刷新**账号池中当前生效的那个账号**：纯账号池部署下只有
+   * `BUDDY_ACCOUNT_*` 凭据，单凭据 ref（`BUDDY_ACCESS_TOKEN`）并不存在，
+   * 旧实现会直接抛「未配置凭据，请先登录」，导致池内 token 过期后无法续期。
+   * 池内没有可刷新账号时回退到单凭据 ref。
+   *
+   * @param pool - 账号池；提供时优先按池内账号续期。
+   */
+  async refresh(pool?: AccountPool): Promise<void> {
+    if (pool) {
+      const refreshed = await this.refreshPoolAccount(pool)
+      if (refreshed) return
+    }
     const ref = credentialRef(BUDDY_CREDENTIAL_REF)
     const resolved = await this.ctx.credentials.resolve(ref)
     if (!resolved) throw new Error('未配置凭据，请先登录')
@@ -189,31 +211,66 @@ export class BuddyAuth extends Service {
       throw new RefreshTokenExpiredError('无 refresh_token，请重新登录')
     }
     try {
-      const token = await refreshToken(credential, this.fetchImpl)
-      // 登出竞态保护：在途刷新期间已 logout()/stop() 时，跳过凭据回写与调度武装，
-      // 避免已登出的凭据被在途刷新复活。
-      if (!this.active) return
-      const refreshed: BuddyCredential = {
-        ...credential,
-        access_token: token.accessToken,
-        refresh_token: token.refreshToken,
-        expires_at: token.expiresAt,
-        refresh_expires_at: token.refreshExpiresAt,
-        token_type: token.tokenType,
-        scope: token.scope,
-        // 后端未返回 domain 时保留原值。
-        ...token.domain.length > 0 ? { domain: token.domain } : {},
-      }
-      await this.ctx.credentials.set(ref, JSON.stringify(refreshed))
-      this.refreshTokenInvalid = false
-      this.lastRefreshError = undefined
-      this.scheduleRefresh()
+      await this.refreshInto(ref, credential)
     } catch (error) {
       // 手动 refresh()（或 llm-adapter 触发）遇 refresh_token 失效同样更新状态，
       // 供 /buddy-status 展示 refreshable: false 与重新登录提示。
       if (error instanceof RefreshTokenExpiredError) this.markRefreshTokenInvalid()
       throw error
     }
+  }
+
+  /**
+   * 刷新账号池中"下一个可用账号"的凭据，并写回该账号自身的 credentialRef。
+   *
+   * @returns 是否刷新了某个池内账号（false 表示池内无可用/可刷新账号）。
+   */
+  private async refreshPoolAccount(pool: AccountPool): Promise<boolean> {
+    const available = await pool.getAvailableAccount('buddy', '')
+    if (!available) return false
+    const credential = available.credential as BuddyCredential
+    if (!isRefreshable(credential)) return false
+    const ref = credentialRef(available.entry.credentialRef)
+    try {
+      await this.refreshInto(ref, credential)
+      const expiresAt = credentialExpiresAtMs(credential)
+      await pool.updateAccount(available.entry.id, {
+        refreshable: true,
+        ...expiresAt === undefined ? {} : { expiresAt },
+      })
+    } catch (error) {
+      if (error instanceof RefreshTokenExpiredError) {
+        this.markRefreshTokenInvalid()
+        try {
+          await pool.updateAccount(available.entry.id, { refreshable: false })
+        } catch { /* 忽略池更新失败，不掩盖原始错误 */ }
+      }
+      throw error
+    }
+    return true
+  }
+
+  /** 用 refresh_token 换取新令牌并写回指定 ref（含登出竞态保护）。 */
+  private async refreshInto(ref: CredentialRef, credential: BuddyCredential): Promise<void> {
+    const token = await refreshToken(credential, this.fetchImpl)
+    // 登出竞态保护：在途刷新期间已 logout()/stop() 时，跳过凭据回写与调度武装，
+    // 避免已登出的凭据被在途刷新复活。
+    if (!this.active) return
+    const refreshed: BuddyCredential = {
+      ...credential,
+      access_token: token.accessToken,
+      refresh_token: token.refreshToken,
+      expires_at: token.expiresAt,
+      refresh_expires_at: token.refreshExpiresAt,
+      token_type: token.tokenType,
+      scope: token.scope,
+      // 后端未返回 domain 时保留原值。
+      ...token.domain.length > 0 ? { domain: token.domain } : {},
+    }
+    await this.ctx.credentials.set(ref, JSON.stringify(refreshed))
+    this.refreshTokenInvalid = false
+    this.lastRefreshError = undefined
+    this.scheduleRefresh()
   }
 
   /**

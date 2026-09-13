@@ -110,11 +110,15 @@ describe('plugin entry', () => {
     expect(result).toEqual({ kind: 'error', text: 'CodeArts login timed out' })
   })
 
-  it('registers the codearts LLM route and the status/refresh commands', () => {
+  it('注册 buddy LLM 路由与 codearts 状态/刷新命令（codearts provider 已停用）', () => {
     const { ctx, commands, llm } = makeContext()
     apply(ctx)
-    expect(llm.providers).toContain('codearts')
-    expect(llm.adapters).toContain('codearts')
+    // CodeArts provider 已在 src/index.ts 中停用（账户未配置），不应出现在模型选择器。
+    // 恢复该 provider 时，需同步把下面两行断言改回 toContain('codearts')。
+    expect(llm.providers).not.toContain('codearts')
+    expect(llm.adapters).not.toContain('codearts')
+    expect(llm.providers).toContain('buddy')
+    // 服务与命令保留，账号池亦保留（buddy 适配器依赖它）
     const names = commands.definitions.map((d) => d.name)
     expect(names).toContain('codearts-status')
     expect(names).toContain('codearts-refresh')

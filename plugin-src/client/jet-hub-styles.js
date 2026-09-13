@@ -49,6 +49,13 @@ const STYLES = `
 .dim-jh-accountTag { flex: none; padding: 1px 8px; border-radius: 999px; font-size: 11px; line-height: 17px; font-weight: 500; }
 .dim-jh-accountTag[data-tone="on"] { color: #15803d; background: rgb(34 197 94 / 12%); }
 .dim-jh-accountTag[data-tone="off"] { color: var(--dsw-alias-label-tertiary, #8f959e); background: rgb(143 149 158 / 12%); }
+/* 站点标签：国际站用蓝色区分，国内站为默认不展示 */
+.dim-jh-accountTag[data-tone="site"] { color: #0f5fce; background: rgb(22 119 255 / 12%); }
+
+/* 站点选择器（buddy 专用）：分段控件 + 说明文字 */
+.dim-jh-editionPicker { display: inline-flex; gap: 4px; padding: 2px; border-radius: 10px; background: var(--dsw-alias-bg-layer-2, #f2f3f5); }
+.dim-jh-editionPicker .dim-jh-btn { border-color: transparent; background: transparent; }
+.dim-jh-editionHint { margin: 0 0 12px; font-size: 12px; line-height: 18px; color: var(--dsw-alias-label-tertiary, #8f959e); }
 
 /* 元信息：键值对齐的网格 */
 .dim-jh-accountMeta { display: grid; gap: 3px; margin: 8px 0 0; }

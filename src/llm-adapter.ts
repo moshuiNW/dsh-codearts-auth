@@ -53,7 +53,13 @@ const MAAS_TYPE_BENEFIT_MODELS: ReadonlySet<string> = new Set(['glm-5.3-flash'])
 
 export interface CodeArtsAdapterOptions {
   credentialRef: CredentialRef
-  resolveCredential: () => Promise<CodeArtsCredential | undefined>
+  /**
+   * 从凭据存储解析凭据。
+   *
+   * `model` 为本次请求的模型 id：多账号池据此**跳过该模型已限流的账号**。
+   * 不传模型时无法做限流过滤（历史行为）。
+   */
+  resolveCredential: (model?: string) => Promise<CodeArtsCredential | undefined>
   refresh: () => Promise<void>
   /** 动态拉取远端模型列表；失败时调用方回退到静态列表。 */
   fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
@@ -797,10 +803,11 @@ export class CodeArtsAdapter extends LlmAdapter {
   }
 
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
-    let credential = await this.options.resolveCredential()
+    // 传入模型 id：账号池据此跳过该模型已限流的账号。
+    let credential = await this.options.resolveCredential(options.model)
     if (credential === undefined || Date.parse(credential.expires_at) <= Date.now()) {
       await this.options.refresh()
-      credential = await this.options.resolveCredential()
+      credential = await this.options.resolveCredential(options.model)
     }
     if (credential === undefined || !credential.access_key_id || !credential.secret_access_key || !credential.security_token) {
       throw new LlmError('codearts: no usable credential; log in first', 'MISSING_CREDENTIAL')
@@ -946,7 +953,7 @@ export class CodeArtsAdapter extends LlmAdapter {
         if (isAuthError(response.status, errorText) && !authRefreshed) {
           authRefreshed = true
           await this.options.refresh()
-          credential = await this.options.resolveCredential()
+          credential = await this.options.resolveCredential(options.model)
           if (credential === undefined || !credential.access_key_id || !credential.secret_access_key || !credential.security_token) {
             throw new LlmError('codearts: credential missing after refresh; log in again', 'MISSING_CREDENTIAL')
           }
@@ -956,8 +963,12 @@ export class CodeArtsAdapter extends LlmAdapter {
         // （外层 for(;;) 会在拿到新凭据后重新签名发请求）。用 tried 集合
         // 保证每个账号只尝试一次，试完才判定"全部受限"——避免只试一个
         // 就下结论，导致 UI 限流状态与实际判定不一致。
-        if (this.options.accountPool && isRateLimited(errorText)) {
-          const parsed = parseRateLimitError(errorText, options.model)
+        //
+        // 判定带上 HTTP 状态码：上游可能返回 429 但响应体为空/非限流措辞。
+        if (this.options.accountPool && isRateLimited(errorText, response.status)) {
+          // parseRateLimitError 在无法解析具体时刻时会给出默认冷却，
+          // 因此这里不再因解析失败而放弃切换账号。
+          const parsed = parseRateLimitError(errorText, options.model, { status: response.status })
           if (parsed) {
             if (currentAccountId) {
               await this.options.accountPool.updateModelRateLimit(
@@ -1421,35 +1432,97 @@ export function registerCodeArtsLlm(ctx: Context, options: CodeArtsAdapterOption
   ctx.llm.registerAdapter([PROVIDER], new CodeArtsAdapter(options))
 }
 
-/** 判断错误文本是否为频率限制错误 */
-export function isRateLimited(body: string): boolean {
-  return /频率限制|rate.?limit|使用量已超出|频率超出|重置/i.test(body)
+/**
+ * 判断响应是否属于频率限制。
+ *
+ * 除响应体措辞外还要看 **HTTP 状态码**：上游（尤其国际站/CDN 边缘节点）在
+ * 限流时可能返回 429 但响应体为空或只有一句 `Too Many Requests`——只匹配
+ * 文本会漏判，导致本该切账号的请求直接按普通错误抛出。
+ *
+ * @param body - 响应体文本（可能为空）。
+ * @param status - HTTP 状态码；429 一律视为限流。
+ */
+export function isRateLimited(body: string, status?: number): boolean {
+  if (status === 429) return true
+  return /频率限制|rate.?limit|使用量已超出|频率超出|重置|too many requests|frequency limit/i.test(body)
 }
 
-/** 从限流错误中提取重置时间 */
+/** 无法从错误消息解析重置时间时的默认冷却时长（60 秒，对齐 workbuddy-gateway）。 */
+export const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 60_000
+
+/** 国内站中文限流措辞：「将在 2026-09-11 18:08:17 UTC+8 重置」。 */
+const RESET_TIME_CN_RE = /将在\s*(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2}:\d{2})\s*(UTC[+-]\d+(?::\d{2})?)?/
+
+/**
+ * 兜底：匹配任意「日期 + 时间(可选 UTC 偏移)」。
+ *
+ * 用于国际站等英文限流消息，例如
+ * `Your usage has exceeded the rate limit. It will reset at 2026-09-05 01:57:00 UTC+8.`
+ * 必须先匹配中文措辞，再退回本正则——否则英文消息解析不出重置时间，
+ * 会被静默降级成默认冷却（把真实的重置时刻丢掉）。
+ */
+const RESET_TIME_GENERIC_RE = /(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\s*(UTC[+-]\d+(?::\d{2})?))?/
+
+/**
+ * 解析「日期 时间 (可选 UTC 偏移)」为毫秒时间戳。
+ *
+ * 时区必须按消息**实际声明**的偏移换算，不能硬编码 UTC+8：国内站下发
+ * `UTC+8`，但国际站可能下发 `UTC+0` 等其它偏移，硬编码会算错若干小时。
+ * 未声明偏移时按 UTC+8 处理（历史行为）。
+ */
+function parseDateTimeWithOffset(date: string, clock: string, zone: string | undefined): number | null {
+  let offsetMinutes = 8 * 60
+  if (zone !== undefined && zone.length > 0) {
+    // 形如 UTC+8 / UTC+08:00 / UTC-5
+    const match = /^UTC([+-])(\d{1,2})(?::(\d{2}))?$/.exec(zone)
+    if (match) {
+      const sign = match[1] === '-' ? -1 : 1
+      const hours = Number(match[2])
+      const minutes = Number(match[3] ?? '0')
+      offsetMinutes = sign * (hours * 60 + minutes)
+    }
+  }
+  const wall = Date.parse(`${date}T${clock}Z`)
+  if (Number.isNaN(wall)) return null
+  // 声明的挂钟时间处于 UTC+offset，故真实 UTC = 挂钟 - offset。
+  return wall - offsetMinutes * 60_000
+}
+
+/**
+ * 从限流错误中提取重置时间。
+ *
+ * 支持国内站中文措辞与国际站英文措辞，并按消息声明的时区偏移换算。
+ * 响应体不是 JSON（如 CDN 返回 HTML）时不再直接放弃——转为文本继续匹配，
+ * 保证切换逻辑仍能拿到一个（哪怕是默认的）冷却时刻。
+ *
+ * @returns 解析出的模型 id 与重置毫秒时间戳；完全无法识别时返回 null。
+ */
 export function parseRateLimitError(
   body: string,
   currentModel: string,
+  options: { status?: number; now?: number } = {},
 ): { modelId: string; resetTimeMs: number } | null {
+  const now = options.now ?? Date.now()
+  // 非 JSON 体（HTML 错误页等）也要能匹配，因此失败时不提前返回。
+  let message = body
   try {
     const data = JSON.parse(body) as Record<string, unknown>
-    const msg = typeof data.msg === 'string' ? data.msg : ''
-    // buddy格式: "您的使用量已超出频率限制，将在 2026-09-11 18:08:17 UTC+8 重置"
-    const resetMatch = /将在\s+([\d-]+\s+[\d:]+)\s+UTC[+-]\d+/.exec(msg)
-    if (resetMatch) {
-      const resetTimeStr = resetMatch[1] + ' UTC+8'
-      const resetMs = Date.parse(resetTimeStr)
-      if (!Number.isNaN(resetMs)) {
-        return { modelId: currentModel, resetTimeMs: resetMs }
-      }
-    }
-    // 标准 OpenAI 429 格式
-    if (isRateLimited(body)) {
-      // fallback: 1小时后重试
-      return { modelId: currentModel, resetTimeMs: Date.now() + 3_600_000 }
-    }
-    return null
+    const candidates = [data.msg, data.message, (data.error as Record<string, unknown> | undefined)?.message]
+    const text = candidates.find((v): v is string => typeof v === 'string' && v.length > 0)
+    if (text !== undefined) message = text
   } catch {
-    return null
+    // 保留原始 body 作为待匹配文本
   }
+
+  const match = RESET_TIME_CN_RE.exec(message) ?? RESET_TIME_GENERIC_RE.exec(message)
+  if (match) {
+    const resetTimeMs = parseDateTimeWithOffset(match[1], match[2], match[3])
+    if (resetTimeMs !== null) return { modelId: currentModel, resetTimeMs }
+  }
+
+  // 能判定为限流但解析不出时刻：给一个短的默认冷却，交由调用方继续切换账号。
+  if (isRateLimited(body, options.status)) {
+    return { modelId: currentModel, resetTimeMs: now + DEFAULT_RATE_LIMIT_COOLDOWN_MS }
+  }
+  return null
 }

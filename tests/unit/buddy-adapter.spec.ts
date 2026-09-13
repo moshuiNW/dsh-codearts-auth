@@ -644,7 +644,10 @@ describe('BuddyAdapter message serialization', () => {
     } as never)
 
     const payload = JSON.parse(body!) as { messages: Array<Record<string, unknown>> }
-    const assistant = payload.messages[0]
+    // 上游硬性要求首条消息为 system（国际站严格校验，缺失则 400 code=11128）；
+    // 本用例历史以 assistant 开头，故适配器在最前注入保底 system。
+    expect(payload.messages[0]).toMatchObject({ role: 'system' })
+    const assistant = payload.messages[1]
     expect(assistant.role).toBe('assistant')
     // 正文为空且带 tool_calls 时 content 必须为 null（对齐 openai_chat.rs）。
     expect(assistant.content).toBeNull()
@@ -653,7 +656,7 @@ describe('BuddyAdapter message serialization', () => {
     expect(assistant.tool_calls).toMatchObject([{ id: 'call_1', type: 'function', function: { name: 'shell' } }])
 
     // 工具结果展开为独立的 role:'tool' 消息。
-    const tool = payload.messages[1]
+    const tool = payload.messages[2]
     expect(tool).toMatchObject({ role: 'tool', tool_call_id: 'call_1', content: 'file.txt' })
   })
 
@@ -945,3 +948,223 @@ describe('BuddyAdapter 账号池限流切换', () => {
 
 /** 端点常量供测试断言引用（避免硬编码字符串漂移）。 */
 export { CHAT_API_BASE }
+
+/**
+ * 国际站（workbuddy.ai）对话路由与会话结构归一化。
+ *
+ * 国际站对"首条消息必须是 system"是**硬校验**（400 code=11128），国内站
+ * 相对宽容。账号池混挂国内/国际账号时，若会话历史不以 system 开头，会
+ * 表现为"约一半请求随机失败"，极难定位——因此适配器必须无条件归一化。
+ */
+describe('BuddyAdapter 国际站支持', () => {
+  it('凭据 edition=intl 时把对话请求发到 workbuddy.ai', async () => {
+    let url: string | undefined
+    let headers: Headers | undefined
+    const adapter = makeAdapter({
+      credential: makeCredential({ edition: 'intl', domain: '' }),
+      fetchImpl: async (input, init) => {
+        url = String(input)
+        headers = new Headers(init?.headers)
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }],
+      signal: new AbortController().signal,
+    } as never)
+    expect(url).toBe('https://www.workbuddy.ai/v2/chat/completions')
+    // X-Domain/Origin/Referer 都要跟着站点走，保持请求指纹自洽。
+    expect(headers?.get('X-Domain')).toBe('www.workbuddy.ai')
+    expect(headers?.get('Origin')).toBe('https://www.workbuddy.ai')
+    expect(headers?.get('Referer')).toBe('https://www.workbuddy.ai/')
+  })
+
+  it('国内站凭据仍发到 copilot.tencent.com（默认行为不变）', async () => {
+    let url: string | undefined
+    const adapter = makeAdapter({
+      credential: makeCredential({ edition: 'cn' }),
+      fetchImpl: async (input) => {
+        url = String(input)
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }],
+      signal: new AbortController().signal,
+    } as never)
+    expect(url).toBe(`${CHAT_API_BASE}/chat/completions`)
+  })
+
+  it('历史以 user 开头且无 system 时注入保底 system（国际站硬校验）', async () => {
+    let body: string | undefined
+    const adapter = makeAdapter({
+      fetchImpl: async (_url, init) => {
+        body = init?.body as string
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }],
+      signal: new AbortController().signal,
+    } as never)
+    const payload = JSON.parse(body!) as { messages: Array<Record<string, unknown>> }
+    expect(payload.messages[0]).toMatchObject({ role: 'system' })
+    expect(payload.messages[1]).toMatchObject({ role: 'user' })
+  })
+
+  it('已有的 system 不会被重复注入或改变顺序', async () => {
+    let body: string | undefined
+    const adapter = makeAdapter({
+      fetchImpl: async (_url, init) => {
+        body = init?.body as string
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      system: 'You are helpful',
+      messages: [{ role: 'user', content: 'hi' }],
+      signal: new AbortController().signal,
+    } as never)
+    const payload = JSON.parse(body!) as { messages: Array<Record<string, unknown>> }
+    expect(payload.messages[0]).toMatchObject({ role: 'system', content: 'You are helpful' })
+    expect(payload.messages.filter((m) => m.role === 'system')).toHaveLength(1)
+  })
+})
+
+/**
+ * 首次选号的限流避让，以及"限流但解析不出时刻"时仍要切换账号。
+ *
+ * 回归背景（两个都不是假设，均已在真实实现上复现）：
+ * 1. 适配器此前调 `resolveCredential()` 不传模型，账号池收到空 modelId 后
+ *    无法做限流过滤（`modelRateLimits['']` 恒为 undefined），于是已限流账号
+ *    仍被选为首发，每个请求都要先撞一次 429 再切换。
+ * 2. 旧 `parseRateLimitError` 在解析不出重置时刻时返回 null，适配器随即
+ *    `break` 直接抛"所有账号均受限"——一个候选账号都没试；非 JSON 的 429
+ *    响应体（CDN HTML 错误页）正是这种情况。
+ */
+describe('BuddyAdapter 选号与限流兜底', () => {
+  it('把模型 id 传给 resolveCredential（账号池据此避让已限流账号）', async () => {
+    const models: Array<string | undefined> = []
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async (model?: string) => {
+        models.push(model)
+        return makeCredential()
+      },
+      refresh: async () => {},
+      fetchImpl: async () => sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'),
+    })
+    await collectChunks(adapter, {
+      model: 'hy4-preview',
+      messages: [{ role: 'user', content: 'hi' }],
+      signal: new AbortController().signal,
+    } as never)
+    expect(models[0]).toBe('hy4-preview')
+  })
+
+  it('429 空响应体（无措辞）也切换账号并最终成功', async () => {
+    const triedTokens: string[] = []
+    const recorded: Array<{ accountId: string; resetAtMs: number }> = []
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: {
+        findAccountIdByCredential: async () => 'acct-1',
+        updateModelRateLimit: async (accountId: string, _m: string, resetAtMs: number) => {
+          recorded.push({ accountId, resetAtMs })
+        },
+        getAvailableAccount: async () => ({
+          entry: { id: 'acct-2' },
+          credential: makeCredential({ access_token: 'AT2' }),
+        }),
+      } as never,
+      fetchImpl: async (_url, init) => {
+        const token = ((init?.headers as Headers)?.get('Authorization') ?? '').replace('Bearer ', '')
+        triedTokens.push(token)
+        // 第一个账号：429 但响应体为空（CDN 边缘节点常见）
+        if (token === 'AT1') return new Response('', { status: 429 })
+        return sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+
+    const chunks = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }],
+      signal: new AbortController().signal,
+    } as never)
+
+    // 必须真的换了账号（修复前：直接抛 QUOTA_EXCEEDED，triedTokens 只有 AT1）
+    expect(triedTokens).toEqual(['AT1', 'AT2'])
+    expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+    // 空体也要留下一个（默认）冷却记录，UI 才有标记可显示
+    expect(recorded).toHaveLength(1)
+    expect(recorded[0].resetAtMs).toBeGreaterThan(Date.now())
+  })
+
+  it('非 JSON 的限流响应体不再导致"一个账号都没试"', async () => {
+    const triedTokens: string[] = []
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: {
+        findAccountIdByCredential: async () => 'acct-1',
+        updateModelRateLimit: async () => {},
+        getAvailableAccount: async () => ({
+          entry: { id: 'acct-2' },
+          credential: makeCredential({ access_token: 'AT2' }),
+        }),
+      } as never,
+      fetchImpl: async (_url, init) => {
+        const token = ((init?.headers as Headers)?.get('Authorization') ?? '').replace('Bearer ', '')
+        triedTokens.push(token)
+        if (token === 'AT1') {
+          return new Response('<html><body>429 Too Many Requests</body></html>', { status: 429 })
+        }
+        return sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }],
+      signal: new AbortController().signal,
+    } as never)
+    expect(triedTokens).toEqual(['AT1', 'AT2'])
+  })
+
+  it('国际站英文限流消息记录的是真实重置时刻（而非盲目 +1 小时）', async () => {
+    const recorded: Array<{ resetAtMs: number }> = []
+    const rateLimited = JSON.stringify({
+      code: 6004,
+      msg: 'Your usage has exceeded the rate limit. It will reset at 2099-09-05 01:57:00 UTC+8.',
+    })
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: {
+        findAccountIdByCredential: async () => 'acct-1',
+        updateModelRateLimit: async (_id: string, _m: string, resetAtMs: number) => {
+          recorded.push({ resetAtMs })
+        },
+        getAvailableAccount: async () => null,
+      } as never,
+      fetchImpl: async () => new Response(rateLimited, { status: 400 }),
+    })
+
+    await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }],
+      signal: new AbortController().signal,
+    } as never).catch(() => {})
+
+    expect(recorded).toHaveLength(1)
+    expect(recorded[0].resetAtMs).toBe(Date.parse('2099-09-05 01:57:00 UTC+8'))
+  })
+})

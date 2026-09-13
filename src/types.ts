@@ -58,6 +58,14 @@ export interface ProviderAccountEntry {
   refreshable: boolean
   /** 每个模型的重置时间，key=模型ID（毫秒时间戳） */
   modelRateLimits?: Record<string, number>
+  /**
+   * 站点标识（仅 buddy provider 使用）：`cn` = 国内站（copilot.tencent.com），
+   * `intl` = 国际站（www.workbuddy.ai）。缺失时按国内站处理。
+   *
+   * 凭据内部也记录同样的 edition；此处冗余一份是为了让账号列表 UI
+   * 无需解析凭据即可展示站点归属。
+   */
+  edition?: string
 }
 
 /** 账号详细状态（返回给 Client 展示） */
@@ -83,6 +91,11 @@ export interface RpcListAccountsResponse {
 
 export interface RpcCreateAccountRequest {
   provider: string
+  /**
+   * 目标站点（仅 buddy 有效）：`cn` = 国内站（默认），`intl` = 国际站。
+   * 国际站登录在浏览器内完成（邮箱/验证码/SSO），等待窗口 15 分钟。
+   */
+  edition?: string
 }
 export interface RpcCreateAccountResponse {
   accountId: string

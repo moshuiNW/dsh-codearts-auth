@@ -256,3 +256,98 @@ describe('buddy runBuddyLoginFlow', () => {
     expect(opened).toEqual([])
   })
 })
+
+/**
+ * 国际站（www.workbuddy.ai）路由。
+ *
+ * 国际站与国内站协议相同，但域名、Origin 与 platform 参数不同，
+ * 且登录在浏览器内完成（等待窗口 15 分钟）。这些差异必须体现在
+ * 实际请求上——否则国际站账号会打到国内站上游而被拒绝。
+ */
+describe('buddy 国际站路由', () => {
+  it('fetchAuthState 打到国际站并使用 platform=workbuddy-ai', async () => {
+    const fetcher = routeFetch([{
+      when: (url) => url.includes('/v2/plugin/auth/state'),
+      respond: () => new Response(JSON.stringify({ code: 0, data: { state: STATE, authUrl: AUTH_URL } }), { status: 200 }),
+    }])
+    await fetchAuthState(fetcher, undefined, 'intl')
+    const [url, init] = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0]
+    expect(url).toContain('https://www.workbuddy.ai/v2/plugin/auth/state')
+    expect(url).toContain('platform=workbuddy-ai')
+    const headers = init.headers as Record<string, string>
+    expect(headers['X-Domain']).toBe('www.workbuddy.ai')
+    // Origin/Referer 必须伪装为国际站 Web 控制台，而不是国内站的 codebuddy.cn。
+    expect(headers.Origin).toBe('https://www.workbuddy.ai')
+    expect(headers.Referer).toBe('https://www.workbuddy.ai/')
+  })
+
+  it('默认（无 edition）仍打国内站 platform=ide，旧行为不变', async () => {
+    const fetcher = routeFetch([{
+      when: (url) => url.includes('/v2/plugin/auth/state'),
+      respond: () => new Response(JSON.stringify({ code: 0, data: { state: STATE, authUrl: AUTH_URL } }), { status: 200 }),
+    }])
+    await fetchAuthState(fetcher)
+    const [url, init] = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0]
+    expect(url).toContain('https://copilot.tencent.com/v2/plugin/auth/state')
+    expect(url).toContain('platform=ide')
+    expect((init.headers as Record<string, string>).Origin).toBe('https://www.codebuddy.cn')
+  })
+
+  it('refreshToken 按凭据 edition 路由到国际站刷新接口', async () => {
+    const fetcher = routeFetch([{
+      when: (url) => url.includes('/v2/plugin/auth/token/refresh'),
+      respond: () => new Response(JSON.stringify({ code: 0, data: { accessToken: 'AT2', refreshToken: 'RT2' } }), { status: 200 }),
+    }])
+    const token = await refreshToken(makeCredential({ edition: 'intl', domain: '' }), fetcher)
+    expect(token.accessToken).toBe('AT2')
+    const [url, init] = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0]
+    expect(url).toBe('https://www.workbuddy.ai/v2/plugin/auth/token/refresh')
+    // 凭据未带 domain 时必须回退国际站域名，而不是国内站。
+    expect((init.headers as Record<string, string>)['X-Domain']).toBe('www.workbuddy.ai')
+  })
+
+  it('fetchModels 按凭据 edition 路由到国际站 /v3/config', async () => {
+    const fetcher = routeFetch([{
+      when: (url) => url.includes('/v3/config'),
+      respond: () => new Response(JSON.stringify({
+        data: { agents: [{ name: 'craft', models: ['hy4-preview'] }] },
+      }), { status: 200 }),
+    }])
+    const models = await fetchModels(makeCredential({ edition: 'intl' }), fetcher)
+    expect(models).toHaveLength(1)
+    const [url] = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls[0]
+    expect(url).toBe('https://www.workbuddy.ai/v3/config')
+  })
+
+  it('runBuddyLoginFlow 把站点标识写入凭据并路由轮询', async () => {
+    const fetcher = routeFetch([
+      {
+        when: (url) => url.includes('/v2/plugin/auth/state'),
+        respond: () => new Response(JSON.stringify({ code: 0, data: { state: STATE, authUrl: AUTH_URL } }), { status: 200 }),
+      },
+      {
+        when: (url) => url.includes('/v2/plugin/auth/token'),
+        respond: () => new Response(JSON.stringify({
+          code: 0,
+          data: { accessToken: 'AT', refreshToken: 'RT', expiresIn: 3600, domain: '' },
+        }), { status: 200 }),
+      },
+      {
+        when: (url) => url.includes('/v2/plugin/login/account'),
+        respond: () => new Response(JSON.stringify({ code: 0, data: { uid: 'u1', nickname: 'nick' } }), { status: 200 }),
+      },
+    ])
+    const result = await runBuddyLoginFlow({
+      fetcher,
+      pollIntervalMs: 0,
+      openBrowser: () => {},
+      edition: 'intl',
+    })
+    const credential = JSON.parse(result.access) as BuddyCredential
+    // 站点标识必须随凭据持久化，后续刷新/对话据此路由。
+    expect(credential.edition).toBe('intl')
+    // 三个控制面请求全部落在国际站。
+    const urls = (fetcher as unknown as { mock: { calls: Array<[string, RequestInit]> } }).mock.calls.map(([url]) => url)
+    expect(urls.every((url) => url.startsWith('https://www.workbuddy.ai/'))).toBe(true)
+  })
+})
