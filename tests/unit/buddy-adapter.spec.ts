@@ -363,6 +363,77 @@ describe('BuddyAdapter credential handling', () => {
     const user = (body.messages as Array<Record<string, unknown>>).find((m) => m.role === 'user')!
     expect(user.content).toBe('hello')
   })
+
+  // read_image 这类工具把图片放在**工具结果内部**。适配器必须递归取出并提升为
+  // user 的 image_url part，否则 base64 被静默丢弃，模型只收到 `<path>…</path>`
+  // 元数据，误以为读图成功——表现为"子 agent 看不见图"。
+  it('stream hoists an image nested inside a tool-result into a user image part', async () => {
+    const body = await captureBody({
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'reading' },
+            { type: 'tool-call', id: 'call_1', name: 'read_image', arguments: '{}' },
+          ],
+        },
+        {
+          role: 'user',
+          content: [{
+            type: 'tool-result',
+            toolCallId: 'call_1',
+            content: [
+              { type: 'text', text: '<path>a.png</path>' },
+              { type: 'image', attachment: { attachmentId: 'att-1' } },
+            ],
+          }],
+        },
+      ],
+    })
+    const messages = body.messages as Array<Record<string, unknown>>
+
+    // 图片以 image_url part 发出。
+    const imageUser = messages.find(
+      (m) => m.role === 'user' && Array.isArray(m.content)
+        && (m.content as Array<Record<string, unknown>>).some((p) => p.type === 'image_url'),
+    )
+    expect(imageUser).toBeDefined()
+    expect(imageUser!.content).toEqual([{ type: 'image_url', image_url: { url: 'data:image/png;base64,AQID' } }])
+
+    // 顺序：tool 消息必须紧跟其 tool_call，图片 user 消息排在其后。
+    // 否则违反上游"tool 消息紧跟 tool_call"硬校验，整个请求 400。
+    const roles = messages.map((m) => m.role)
+    const assistantIndex = roles.indexOf('assistant')
+    expect(roles[assistantIndex + 1]).toBe('tool')
+    expect(roles[assistantIndex + 2]).toBe('user')
+  })
+
+  it('stream does not duplicate tool-result text into the hoisted user parts', async () => {
+    const body = await captureBody({
+      readImage: async () => ({ data: new Uint8Array([1, 2, 3]), mediaType: 'image/png' }),
+      messages: [
+        {
+          role: 'assistant',
+          content: [{ type: 'tool-call', id: 'call_1', name: 'read_image', arguments: '{}' }],
+        },
+        {
+          role: 'user',
+          content: [{
+            type: 'tool-result',
+            toolCallId: 'call_1',
+            content: [
+              { type: 'text', text: 'UNIQUE_TOOL_TEXT' },
+              { type: 'image', attachment: { attachmentId: 'att-1' } },
+            ],
+          }],
+        },
+      ],
+    })
+    const messages = body.messages as Array<Record<string, unknown>>
+    const occurrences = JSON.stringify(messages).split('UNIQUE_TOOL_TEXT').length - 1
+    expect(occurrences).toBe(1)
+  })
 })
 
 describe('BuddyAdapter stream parsing', () => {

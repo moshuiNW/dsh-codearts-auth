@@ -251,19 +251,35 @@ function serializeMessages(
     const text = contentToText(message.content)
     // 含图片时 content 升级为 OpenAI 多模态 parts（CodeBuddy 唯一接受的图片
     // 形态；{type:'image'} 会以 `unsupported content type ... image` 400）。
+    // userContentParts 递归展开工具结果，因此 `read_image` 这类把图片放在
+    // 工具结果内部的工具也在此被提升为 image_url——否则 base64 会被静默丢弃，
+    // 模型只收到 `<path>…</path>` 元数据，误以为读图成功。
     const parts = imageUrls === undefined || imageUrls.size === 0
       ? undefined
       : userContentParts(content, imageUrls)
-    if (parts !== undefined) wire.push({ role: 'user', content: parts })
-    else if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
-    for (const result of toolResults) {
-      // 丢弃孤儿工具结果：没有对应 assistant tool_call 其结果同样会让后端 400。
-      if (!keepResultIds.has(String(result.toolCallId))) continue
-      wire.push({
-        role: 'tool',
-        tool_call_id: String(result.toolCallId),
-        content: contentToText(result.content) || '(no output)',
-      })
+    /** 展开工具结果为 role:'tool' 消息，丢弃孤儿结果（缺配对会 400）。 */
+    const pushToolResults = (): void => {
+      for (const result of toolResults) {
+        if (!keepResultIds.has(String(result.toolCallId))) continue
+        wire.push({
+          role: 'tool',
+          tool_call_id: String(result.toolCallId),
+          // 工具消息只承载文本（OpenAI 协议不允许 tool 消息携带图片）；
+          // 图片已提升到随后的 user 多模态消息里。
+          content: contentToText(result.content) || '(no output)',
+        })
+      }
+    }
+    if (parts !== undefined) {
+      // 图片请求：必须先发完全部 role:'tool' 消息，再把图片作为**其后**的
+      // user 消息发出。若把图片 user 消息插在 assistant 与 tool 之间，就违反
+      // "tool 消息紧跟其 tool_call" 的上游硬校验，整个请求会被 400 拒绝。
+      pushToolResults()
+      wire.push({ role: 'user', content: parts })
+    } else {
+      // 无图路径保持原样：线上格式不变，避免破坏前缀缓存命中。
+      if (text.length > 0 || toolResults.length === 0) wire.push({ role: 'user', content: text })
+      pushToolResults()
     }
   }
   return wire
@@ -375,19 +391,30 @@ function isTransportError(error: unknown): boolean {
 }
 
 /**
- * 把 user 消息内容块转为 OpenAI 多模态 parts；无图片时返回 undefined，
- * 让调用方保持原有的纯字符串路径（无图请求的线上格式不变，避免破坏前缀缓存）。
+ * 递归展开内容块为 OpenAI 多模态 parts，返回是否遇到过图片。
+ *
+ * `tool-result` 需要递归取图：`read_image` 这类工具把图片放在工具结果**内部**，
+ * 而工具结果的图片同样必须被提升（见 {@link userContentParts}）。
+ * 递归时 **includeText=false**：工具结果的文本已由随后的 role:'tool' 消息
+ * 承载，再放进 user parts 会让同一段文本在请求里出现两次。
  */
-function userContentParts(
+function appendContentParts(
   content: readonly unknown[],
   imageUrls: ReadonlyMap<string, string>,
-): Array<Record<string, unknown>> | undefined {
-  const parts: Array<Record<string, unknown>> = []
+  parts: Array<Record<string, unknown>>,
+  includeText: boolean,
+): boolean {
   let hasImage = false
   for (const raw of content) {
     if (typeof raw !== 'object' || raw === null) continue
-    const block = raw as { type?: unknown; text?: unknown; attachment?: { attachmentId?: unknown } }
+    const block = raw as {
+      type?: unknown
+      text?: unknown
+      content?: unknown
+      attachment?: { attachmentId?: unknown }
+    }
     if (block.type === 'text') {
+      if (!includeText) continue
       const text = String(block.text ?? '')
       if (text.length > 0) parts.push({ type: 'text', text })
       continue
@@ -401,8 +428,25 @@ function userContentParts(
       parts.push(url === undefined
         ? { type: 'text', text: '[image unavailable]' }
         : { type: 'image_url', image_url: { url } })
+      continue
+    }
+    if (block.type === 'tool-result' && Array.isArray(block.content)) {
+      if (appendContentParts(block.content, imageUrls, parts, false)) hasImage = true
     }
   }
+  return hasImage
+}
+
+/**
+ * 把 user 消息内容块转为 OpenAI 多模态 parts；无图片时返回 undefined，
+ * 让调用方保持原有的纯字符串路径（无图请求的线上格式不变，避免破坏前缀缓存）。
+ */
+function userContentParts(
+  content: readonly unknown[],
+  imageUrls: ReadonlyMap<string, string>,
+): Array<Record<string, unknown>> | undefined {
+  const parts: Array<Record<string, unknown>> = []
+  const hasImage = appendContentParts(content, imageUrls, parts, true)
   return hasImage && parts.length > 0 ? parts : undefined
 }
 
