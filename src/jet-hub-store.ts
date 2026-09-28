@@ -239,22 +239,47 @@ class MemoryStore implements JetHubStore {
 }
 
 /**
- * 旧凭据 ref → 账号条目的前缀表。
+ * provider id ↔ 凭据 ref 前缀的**单一真相源**。
  *
- * 六个 provider 的账号凭据一律存 `{PREFIX}_ACCOUNT_{UUID_SHORT}`（本插件的既有
- * 约定），故可据 ref 名反推 provider。
+ * 账号凭据一律存 `{PREFIX}_ACCOUNT_{UUID_SHORT}`（本插件的既有约定），故可据
+ * ref 名反推 provider；表与正则都由本表派生，避免「加了 provider 却漏改正则」
+ * 这类两处漂移。
+ *
+ * ⚠️ **必须与 `jet-hub-rpc.ts` 的 `account.create` 生成的 ref 前缀保持一致**
+ * （那里是 `${provider.toUpperCase()}_ACCOUNT_${suffix}`）。**新增 provider 时
+ * 漏加本表会让该 provider 的账号在状态文档丢失后静默消失** —— 真实缺陷：
+ * 本表原只有 6 项（注释也写着"六个 provider"），而插件实际有 10 个，
+ * `qodercn` / `cline` / `loomy` / `raccoon` 四个 provider 的账号在
+ * `state.json` 缺失时**无法从 `.credentials.yaml` 恢复**，用户侧表现为
+ * 「重装 / 迁移后这几个面板的账号凭空消失，只能重新登录」。
+ *
+ * 依据 `src/product.ts` 与各 `*-product.ts` 的 `id` 字段：
+ * `codearts` / `buddy` / `workbuddy` / `lobsterai` / `qoder` / `qodercn`
+ * / `trae` / `cline` / `loomy` / `raccoon`。
  */
-const PROVIDER_BY_REF_PREFIX: Record<string, string> = {
-  CODEARTS: 'codearts',
-  BUDDY: 'buddy',
-  WORKBUDDY: 'workbuddy',
-  LOBSTERAI: 'lobsterai',
-  QODER: 'qoder',
-  TRAE: 'trae',
-}
+const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
+  ['CODEARTS', 'codearts'],
+  ['BUDDY', 'buddy'],
+  ['WORKBUDDY', 'workbuddy'],
+  ['LOBSTERAI', 'lobsterai'],
+  ['QODER', 'qoder'],
+  ['QODERCN', 'qodercn'],
+  ['TRAE', 'trae'],
+  ['CLINE', 'cline'],
+  ['LOOMY', 'loomy'],
+  ['RACCOON', 'raccoon'],
+]
 
-/** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`。 */
-const ACCOUNT_REF_RE = /^(CODEARTS|BUDDY|WORKBUDDY|LOBSTERAI|QODER|TRAE)_ACCOUNT_([0-9A-Fa-f]{6,})$/
+/** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`（前缀由单一真相源派生）。 */
+const ACCOUNT_REF_RE = new RegExp(
+  // ⚠️ 按长度**降序**排列：`QODERCN` 必须以 `QODER` 之前尝试，否则正则的
+  // 回溯虽然最终仍能匹配成功，但一旦将来加入更多同前缀的 provider（如
+  // `QODERX`），顺序错误会让匹配结果取决于运气而非规则。
+  `^(${REF_PREFIX_TO_PROVIDER
+    .map(([prefix]) => prefix)
+    .sort((a, b) => b.length - a.length)
+    .join('|')})_ACCOUNT_([0-9A-Fa-f]{6,})$`,
+)
 
 /**
  * 从 `.credentials.yaml` 的 `refs:` 段提取 ref 名（**只取键名，不读值**）。
@@ -284,9 +309,11 @@ function extractCredentialRefNames(text: string): string[] {
 function accountFromCredentialRef(ref: string): ProviderAccountEntry | undefined {
   const match = ACCOUNT_REF_RE.exec(ref)
   if (match === null) return undefined
-  const provider = PROVIDER_BY_REF_PREFIX[match[1] as string]
+  const prefix = match[1]
   const suffix = match[2]
-  if (provider === undefined || suffix === undefined) return undefined
+  if (prefix === undefined || suffix === undefined) return undefined
+  const provider = REF_PREFIX_TO_PROVIDER.find(([candidate]) => candidate === prefix)?.[1]
+  if (provider === undefined) return undefined
   const id = `${provider}-${suffix.toLowerCase()}`
   return {
     id,

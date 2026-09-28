@@ -1565,7 +1565,18 @@ export class BuddyAdapter extends LlmAdapter {
     headers.set('Authorization', `Bearer ${credential.access_token}`)
     headers.set('Accept', 'text/event-stream')
     headers.set('Content-Type', 'application/json')
-    headers.set(HTTP_HEADER_DOMAIN, credential.domain ?? this.product.apiDomain)
+    // ⚠️ 顺序与空值语义都不能改（真实缺陷，两处都错过）：
+    // ① **以产品配置为准**，而不是优先用凭据里的 `credential.domain`。凭据的
+    //    domain 是「登录时站点」的快照；产品改造后（早期 workbuddy 指向
+    //    copilot.tencent.com，现为 www.workbuddy.ai）旧凭据里仍是过期值。
+    //    本请求的 baseURL 取自 `product.endpoint`，X-Domain 必须与之一致，
+    //    否则身份标识与目的地址自相矛盾。`src/credits.ts` 的 `checkinHeaders`
+    //    早已按此推理实现，此处原先与它相反 —— 同一账号的聊天与积分请求会
+    //    声明**不同的** X-Domain，属两处实现漂移。
+    // ② 必须用 `||` 而非 `??`：domain 经 `readStringField` 读取，字段缺失时返回
+    //    **空串**（不是 undefined），`??` 对空串不生效，X-Domain 会以空值发出
+    //    （已用单测复现：`''` 未回退到 `copilot.tencent.com`）。
+    headers.set(HTTP_HEADER_DOMAIN, this.product.apiDomain || credential.domain || '')
     headers.set(HTTP_HEADER_PRODUCT_CODE, this.product.productCode)
     // 用量归属头族：后台「使用端」列按这组头归因，缺任一个都会显示为 `-`。
     // 注意 X-Product 是**归属名**（产品名），不是部署类型 —— 历史实现发成

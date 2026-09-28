@@ -172,6 +172,21 @@ describe('buddy request headers', () => {
     expect(credentialRequestHeaders({ access_token: 'AT', refresh_token: 'RT' })['X-Domain']).toBe('copilot.tencent.com')
   })
 
+  /**
+   * 回归：**空串** domain 也必须回退（`??` 对空串不生效）。
+   *
+   * 这不是构造出来的边界 —— `parseTokenData` 用 `readStringField` 读 domain，
+   * 后端未下发该字段时返回的是**空串**，故该凭据形态在真实登录后即可出现。
+   * 修复前此处发出 `X-Domain: ''`（已实测复现）。
+   *
+   * ⚠️ 上一条用例传的是「字段缺失」（`domain === undefined`），恰好绕过了本缺陷，
+   * 因此本用例必须显式传空串才能锁住它。
+   */
+  it('requestHeaders 对空串 domain 同样回退（?? 的陷阱）', () => {
+    expect(credentialRequestHeaders({ access_token: 'AT', refresh_token: 'RT', domain: '' })['X-Domain'])
+      .toBe('copilot.tencent.com')
+  })
+
   it('requestHeaders adds enterprise headers only for enterprise accounts', () => {
     const personal = credentialRequestHeaders({ access_token: 'AT', refresh_token: 'RT', enterprise_id: '' })
     expect(personal['X-Enterprise-Id']).toBeUndefined()

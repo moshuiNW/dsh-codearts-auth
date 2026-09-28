@@ -964,6 +964,46 @@ describe('BuddyAdapter credential handling', () => {
     expect(seen!.get('User-Agent')).toBe('CodeBuddyIDE/1.106.1')
   })
 
+  /**
+   * 回归：凭据 domain 为**空串**时 X-Domain 必须回退到产品域名。
+   *
+   * `parseTokenData` → `readStringField` 在字段缺失时返回空串，故这是真实可达
+   * 的凭据形态。修复前这里发出的头是空值（`??` 对空串不生效，已实测复现）。
+   */
+  it('凭据 domain 为空串时 X-Domain 回退到产品域名', async () => {
+    let seen: Headers | undefined
+    const adapter = makeAdapter({
+      credential: makeCredential({ domain: '' }),
+      fetchImpl: async (_url, init) => {
+        seen = new Headers(init?.headers as HeadersInit)
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, streamOptions)
+    expect(seen!.get('X-Domain')).toBe('copilot.tencent.com')
+  })
+
+  /**
+   * 回归：X-Domain 以**产品**为准，不跟随凭据里的历史域名。
+   *
+   * 与 `tests/unit/credits.spec.ts` 的同名用例成对：聊天与积分两条路径必须就
+   * 「X-Domain 由谁决定」给出一致答案。修复前适配器取的是凭据值，于是同一账号
+   * 的聊天请求声明旧域名（凭据快照）而积分请求声明产品域名 —— 两处实现漂移。
+   */
+  it('凭据 domain 与产品不符时，X-Domain 以产品配置为准', async () => {
+    let seen: Headers | undefined
+    const adapter = makeAdapter({
+      product: WORKBUDDY,
+      credential: makeCredential({ domain: 'copilot.tencent.com' }),
+      fetchImpl: async (_url, init) => {
+        seen = new Headers(init?.headers as HeadersInit)
+        return sseResponse('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+      },
+    })
+    await collectChunks(adapter, streamOptions)
+    expect(seen!.get('X-Domain')).toBe('www.workbuddy.ai')
+  })
+
   /** 抓取一次 stream() 实际发出的请求体；overrides 同时用于 adapter 与请求。 */
   async function captureBody(overrides: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     let body: Record<string, unknown> = {}
