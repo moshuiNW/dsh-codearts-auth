@@ -1692,6 +1692,52 @@ describe('BuddyAdapter 账号池限流切换', () => {
     expect(pool.recorded.every((r) => r.resetAtMs > Date.now())).toBe(true)
   })
 
+  /**
+   * 回归：**空体 429** 必须同样触发换号。
+   *
+   * 真实缺陷：`isRateLimited` 原先只接收响应体，服务端（网关 / CDN / 限流
+   * 中间件）返回**空体** 429 时结构化 code 与文案判据双双不命中 → 返回 false
+   * → 适配器 `if (accountPool && isRateLimited(...))` 整块**被跳过**，既不在
+   * 池里换号、也不记录限流标记，而是把原始 429 直接抛给用户。
+   * 用户侧表现：「池里明明还有可用账号，插件却直接报错、也不换号」。
+   *
+   * ⚠️ 本用例的响应体刻意为空串 —— 若传任何含限流措辞的正文，缺陷就不会
+   * 暴露（那正是上一条用例无法覆盖它的原因）。
+   */
+  it('空体 429 也触发换号（状态码兜底，不只认正文）', async () => {
+    const pool = makePool(
+      { id: 'acct-1', token: 'AT1' },
+      [{ id: 'acct-2', token: 'AT2' }],
+    )
+    const sentTokens: string[] = []
+    const adapter = new BuddyAdapter({
+      credentialRef: CREDENTIAL_REF,
+      resolveCredential: async () => makeCredential({ access_token: 'AT1' }),
+      refresh: async () => {},
+      accountPool: pool as never,
+      fetchImpl: async (_url, init) => {
+        const auth = (init?.headers as Headers | undefined)?.get('Authorization') ?? ''
+        const token = auth.replace('Bearer ', '')
+        sentTokens.push(token)
+        // AT1 返回**空体 429**，AT2 成功 —— 必须换到 AT2
+        if (token === 'AT2') {
+          return sseResponse('data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n')
+        }
+        return new Response('', { status: 429 })
+      },
+    })
+
+    const chunks = await collectChunks(adapter, {
+      model: DEFAULT_MODEL,
+      messages: [{ role: 'user', content: 'hi' }] as never,
+      signal: new AbortController().signal,
+    } as never)
+
+    // 核心断言：换号确实发生了（修复前这里只有 ['AT1']，然后直接抛错）
+    expect(sentTokens).toEqual(['AT1', 'AT2'])
+    expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+  })
+
   it('全部账号限流后才报错，且错误码为不可重试的 QUOTA_EXCEEDED', async () => {
     const pool = makePool({ id: 'acct-1', token: 'AT1' }, [{ id: 'acct-2', token: 'AT2' }])
     const adapter = new BuddyAdapter({
