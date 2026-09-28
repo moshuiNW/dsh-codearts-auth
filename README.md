@@ -6,6 +6,9 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 为显式回退（`flow: 'ticket'`）。插件还注册一个 `codearts` LLM provider 路由，使该
 凭证可直接用于 CodeArts 后端模型调用。
 
+> **来源与致谢**：本仓库派生自 [iJetLi/deepseek-harness-codearts](https://gitee.com/iJetLi/deepseek-harness-codearts)
+> （MIT），跟随上游同步。原版权声明见 [LICENSE](LICENSE)。
+
 此外插件内置另外五个 provider 路由：
 
 - **buddy（腾讯 CodeBuddy）** — 见 [buddy provider](#buddy-provider)；
@@ -42,13 +45,13 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 
 ```yaml
 allowBuilds:
-  dsh-codearts-auth@git+https://gitee.com/iJetLi/deepseek-harness-codearts.git: true
+  dsh-codearts-auth@git+https://github.com/moshuiNW/dsh-codearts-auth.git: true
 ```
 
-再用 `dsh plugin add` 从 gitee 拉取并安装：
+再用 `dsh plugin add` 从 GitHub 拉取并安装：
 
 ```sh
-dsh plugin --profile <name> add "https://gitee.com/iJetLi/deepseek-harness-codearts.git"
+dsh plugin --profile <name> add "https://github.com/moshuiNW/dsh-codearts-auth.git"
 ```
 
 `add` 以 `git+https` 方式安装，pnpm 会运行 `prepare` 脚本自动构建 `lib/`，无需
