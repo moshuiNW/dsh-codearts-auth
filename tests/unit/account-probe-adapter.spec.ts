@@ -50,6 +50,40 @@ vi.mock('../../src/trae-adapter.js', () => {
   return { TraeAdapter: MockTraeAdapter }
 })
 
+vi.mock('../../src/qoder-adapter.js', () => {
+  /** 同款桩：只记录构造与 `stream()` 入参，不发网络请求。 */
+  class MockQoderAdapter {
+    static readonly instances: Array<{ product?: { id: string } }> = []
+    static readonly streamOptions: Array<{ system?: string; messages?: unknown }> = []
+    constructor(options: { product?: { id: string } }) {
+      MockQoderAdapter.instances.push(options)
+    }
+    // eslint-disable-next-line require-yield
+    async *stream(options: { system?: string; messages?: unknown }): AsyncGenerator<never> {
+      MockQoderAdapter.streamOptions.push(options)
+      throw new LlmError('频率限制', 'RATE_LIMIT')
+    }
+  }
+  return { QoderAdapter: MockQoderAdapter }
+})
+
+vi.mock('../../src/cline-adapter.js', () => {
+  /** 同款桩：只记录构造与 `stream()` 入参，不发网络请求。 */
+  class MockClineAdapter {
+    static readonly instances: Array<{ product?: { id: string } }> = []
+    static readonly streamOptions: Array<{ system?: string; messages?: unknown }> = []
+    constructor(options: { product?: { id: string } }) {
+      MockClineAdapter.instances.push(options)
+    }
+    // eslint-disable-next-line require-yield
+    async *stream(options: { system?: string; messages?: unknown }): AsyncGenerator<never> {
+      MockClineAdapter.streamOptions.push(options)
+      throw new LlmError('频率限制', 'RATE_LIMIT')
+    }
+  }
+  return { ClineAdapter: MockClineAdapter }
+})
+
 /**
  * `CodeArtsAdapter` 换成桩，但保留 `isRateLimited` 等**真实导出**。
  *
@@ -102,6 +136,22 @@ async function traeStreamOptions(): Promise<Array<{ system?: string; messages?: 
     TraeAdapter: { streamOptions: Array<{ system?: string; messages?: unknown }> }
   }
   return mod.TraeAdapter.streamOptions
+}
+
+/** 取 Qoder 桩的构造记录。 */
+async function qoderInstances(): Promise<Array<{ product?: { id: string } }>> {
+  const mod = await import('../../src/qoder-adapter.js') as unknown as {
+    QoderAdapter: { instances: Array<{ product?: { id: string } }> }
+  }
+  return mod.QoderAdapter.instances
+}
+
+/** 取 Cline 桩的构造记录。 */
+async function clineInstances(): Promise<Array<{ product?: { id: string } }>> {
+  const mod = await import('../../src/cline-adapter.js') as unknown as {
+    ClineAdapter: { instances: Array<{ product?: { id: string } }> }
+  }
+  return mod.ClineAdapter.instances
 }
 
 /** 取 CodeArts 桩的构造记录（用于断言「没有走错分支」）。 */
@@ -251,6 +301,80 @@ describe('account-probe 适配器选择 · TRAE 不得落入 CodeArts 分支', (
     expect(await codeartsInstances()).toHaveLength(1)
     expect(await traeInstances()).toHaveLength(0)
     expect(await adapterInstances()).toHaveLength(0)
+  })
+})
+
+/**
+ * 回归：**Qoder 系（qoder / qodercn）与 Cline 不得落入 CodeArts 分支**。
+ *
+ * ## 真实缺陷（本分派表第三次复发）
+ *
+ * 前两次是 `workbuddy` 与 `trae`（见上文两节）。补上 trae 之后，表里仍缺
+ * `qoder` / `qodercn` / `cline` —— 三者会一路落到 `else`，被交给
+ * `CodeArtsAdapter`（华为云 `SDK-HMAC-SHA256` 签名 + 华为云端点）去发
+ * Qoder / Cline 的凭据，探测**必然失败**。
+ *
+ * 与 workbuddy / trae 那两次不同的是，这三个 provider 的失败是**用户可见
+ * 且必然触发**的：
+ *
+ * - 前端 `RATE_LIMIT_CAPABILITIES` 对未登记的 provider **默认视为有限流**
+ *   （刻意的，避免新增 provider 时凭空丢掉按钮），故它们的「重测 / 重置」
+ *   按钮**确实会渲染**；
+ * - 且 Qoder 的额度受限**每次都会**写 `modelRateLimits`
+ *   （`QoderAdapter.switchAccountOnQuota` 按 UTC+8 当日 24:00 标记该模型），
+ *   于是「点了重测 → 报签名错误 → 标记还在」成为稳定可复现的死循环。
+ *
+ * ⚠️ 这三个 provider 的查表函数**本来就存在**（`qoderProductById` /
+ * `clineProductById`），只是没被接上 —— 与 trae「压根没有查表函数」不同，
+ * 所以修复只需接线，不需要新增数据。
+ */
+describe('account-probe 适配器选择 · qoder / qodercn / cline 不得落入 CodeArts 分支', () => {
+  beforeEach(async () => {
+    ;(await adapterInstances()).length = 0
+    ;(await streamOptions()).length = 0
+    ;(await traeInstances()).length = 0
+    ;(await traeStreamOptions()).length = 0
+    ;(await codeartsInstances()).length = 0
+    ;(await qoderInstances()).length = 0
+    ;(await clineInstances()).length = 0
+  })
+
+  it.each([
+    ['qoder', 'QODER_ACCOUNT_TEST'],
+    ['qodercn', 'QODERCN_ACCOUNT_TEST'],
+  ])('%s 账号走 QoderAdapter 而不是 CodeArtsAdapter', async (provider, credentialRef) => {
+    const { retestAccount } = await import('../../src/account-probe.js')
+    const id = `${provider}-1`
+    const result = await retestAccount(makePool([makeEntry({ id, provider, credentialRef })]), id)
+
+    // 仍受限（桩抛限流错误），但关键在于是**由 QoderAdapter** 发起的
+    expect(result.tested).toBe(1)
+    expect(result.stillLimited).toHaveLength(1)
+
+    const qoder = await qoderInstances()
+    expect(qoder).toHaveLength(1)
+    // 产品必须随 provider 正确分派：国际版与 CN 共用同一个适配器类，
+    // 若这里带上错误的产品配置，请求会发到错的区域/端点。
+    expect(qoder[0]?.product?.id).toBe(provider)
+    // 核心断言：**没有**构造 CodeArtsAdapter（否则就是用华为云签名发 Qoder 请求）。
+    expect(await codeartsInstances()).toHaveLength(0)
+  })
+
+  it('cline 账号走 ClineAdapter 而不是 CodeArtsAdapter', async () => {
+    const { retestAccount } = await import('../../src/account-probe.js')
+    const result = await retestAccount(makePool([makeEntry({
+      id: 'cline-1',
+      provider: 'cline',
+      credentialRef: 'CLINE_ACCOUNT_TEST',
+    })]), 'cline-1')
+
+    expect(result.tested).toBe(1)
+    expect(result.stillLimited).toHaveLength(1)
+
+    const cline = await clineInstances()
+    expect(cline).toHaveLength(1)
+    expect(cline[0]?.product?.id).toBe('cline')
+    expect(await codeartsInstances()).toHaveLength(0)
   })
 })
 
