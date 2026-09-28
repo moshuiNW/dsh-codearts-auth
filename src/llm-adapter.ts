@@ -1014,7 +1014,9 @@ export class CodeArtsAdapter extends LlmAdapter {
         // （外层 for(;;) 会在拿到新凭据后重新签名发请求）。用 tried 集合
         // 保证每个账号只尝试一次，试完才判定"全部受限"——避免只试一个
         // 就下结论，导致 UI 限流状态与实际判定不一致。
-        if (this.options.accountPool && isRateLimited(errorText)) {
+        // ⚠️ 必须传 `response.status`：空体 429 时只看正文会判为非限流，
+        // 整段换号逻辑被跳过（见 isRateLimited 的说明）。
+        if (this.options.accountPool && isRateLimited(errorText, response.status)) {
           const parsed = parseRateLimitError(errorText, options.model)
           if (parsed) {
             if (currentAccountId) {
@@ -1843,8 +1845,26 @@ function hasRateLimitBusinessCode(body: string): boolean {
   }
 }
 
-/** 判断错误文本是否为频率限制错误 */
-export function isRateLimited(body: string): boolean {
+/**
+ * 判断错误文本是否为频率限制错误。
+ *
+ * @param body - 响应体（可能为空串）
+ * @param status - HTTP 状态码（**可选，但强烈建议传**）。为 `429` 时无条件判为
+ *   限流，即使响应体为空或不含任何可识别文案。
+ *
+ * ⚠️ **`status` 参数是真实缺陷的修复，不是可选便利**：本函数原先只接收响应体，
+ * 而服务端（网关 / CDN / 限流中间件）完全可能返回**空体**的 429 —— 此时
+ * `hasRateLimitBusinessCode` 与 `RATE_LIMIT_PATTERN` **双双不命中**，函数返回
+ * `false`，于是适配器的整段「记录重置时间 + 切换账号」分支被**整体跳过**，
+ * 把一个本可自愈的限流错误直接抛给用户（表现为「换个账号就能好，插件却报错
+ * 且不换号」）。已实测复现：`isRateLimited('')` 为 `false`。
+ *
+ * 判据顺序刻意是「状态码优先」：429 是 HTTP 语义上**唯一**的限流信号，无需也不应
+ * 再去猜文案；文案兜底只服务于「状态码不是 429、但正文表达了限流」的场景
+ * （如业务码 6004、SSE 流内错误、网关包装过的 200/400）。
+ */
+export function isRateLimited(body: string, status?: number): boolean {
+  if (status === 429) return true
   return hasRateLimitBusinessCode(body) || RATE_LIMIT_PATTERN.test(body)
 }
 

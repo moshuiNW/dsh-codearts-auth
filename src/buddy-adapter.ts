@@ -1459,7 +1459,10 @@ export class BuddyAdapter extends LlmAdapter {
       // 其余可用账号。每个失败账号都会被记录，只有真正试完全部候选才报
       // "所有账号均受限"——避免只试一个就下结论（那会让 UI 显示的限流
       // 状态与实际判定不一致）。
-      if (this.options.accountPool && isRateLimited(errorText)) {
+      // ⚠️ 必须把 `response.status` 一并传入：服务端可能返回**空体**的 429，
+      // 而 isRateLimited 只看正文时对空体恒为 false → 整段换号逻辑被跳过，
+      // 本可自愈的限流被直接抛给用户。
+      if (this.options.accountPool && isRateLimited(errorText, response.status)) {
         const tried = new Set<string>()
         if (currentAccountId) tried.add(currentAccountId)
 
@@ -1534,7 +1537,9 @@ export class BuddyAdapter extends LlmAdapter {
           // ② 认证类失败：该账号凭据不可用，与路径 A 一致继续换号。
           if (response.status === 401 || response.status === 403) continue
           // ③ 其余非限流错误：请求本身有问题，换号无益，按原错误分类抛出。
-          if (!isRateLimited(errorText)) {
+          // ⚠️ 同样传状态码：否则空体 429 会被当成「非限流」而在换号途中**中断**，
+          // 池里其余可用账号一个都试不到（与 11140 那条「换号提前中断」同型）。
+          if (!isRateLimited(errorText, response.status)) {
             // 新账号失败但不是限流：按原错误分类抛出，不要再吞成"均受限"
             throw new LlmError(`${this.product.id}: ${errorDetail(errorText)}`, httpErrorCode(response.status, errorText), { status: response.status })
           }
