@@ -253,9 +253,16 @@ class MemoryStore implements JetHubStore {
  * `state.json` 缺失时**无法从 `.credentials.yaml` 恢复**，用户侧表现为
  * 「重装 / 迁移后这几个面板的账号凭空消失，只能重新登录」。
  *
+ * ⚠️ **同一缺陷在 `zcode` 上又犯过一次**（上游新增第 11 个 provider 时）：
+ * zcode 账号同样由 `account.create` 生成 `ZCODE_ACCOUNT_{HEX}`
+ * （`src/index.ts` 的 zcode 段落亦如此说明），漏登记则重装 / 迁移后
+ * zcode 账号静默消失。**新增 provider 时必须同步本表** ——
+ * 且注意单凭据回退 ref（如 `ZCODE_CREDENTIAL`）不含 `_ACCOUNT_`，
+ * 不会被本表误吞，故本表只需登记账号 ref 前缀。
+ *
  * 依据 `src/product.ts` 与各 `*-product.ts` 的 `id` 字段：
  * `codearts` / `buddy` / `workbuddy` / `lobsterai` / `qoder` / `qodercn`
- * / `trae` / `cline` / `loomy` / `raccoon`。
+ * / `trae` / `cline` / `loomy` / `raccoon` / `zcode`。
  */
 const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   ['CODEARTS', 'codearts'],
@@ -268,6 +275,7 @@ const REF_PREFIX_TO_PROVIDER: ReadonlyArray<readonly [string, string]> = [
   ['CLINE', 'cline'],
   ['LOOMY', 'loomy'],
   ['RACCOON', 'raccoon'],
+  ['ZCODE', 'zcode'],
 ]
 
 /** 账号凭据 ref 形态：`{PREFIX}_ACCOUNT_{HEX}`（前缀由单一真相源派生）。 */

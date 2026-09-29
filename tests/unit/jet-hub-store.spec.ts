@@ -250,18 +250,21 @@ describe('文件后端（FileStore）', () => {
   })
 
   /**
-   * 回归：**全部 10 个 provider** 的账号 ref 都必须能恢复。
+   * 回归：**全部 11 个 provider** 的账号 ref 都必须能恢复。
    *
    * 真实缺陷：恢复表原先只有 6 项（注释也写着「六个 provider」），而插件实际
    * 有 10 个 —— `qodercn` / `cline` / `loomy` / `raccoon` 的账号在状态文档
    * 缺失时**静默消失**（用户侧表现：「重装 / 迁移后这几个面板的账号凭空不见，
    * 只能重新登录」）。凭据本体一直在 `.credentials.yaml` 里，只是索引建不出来。
    *
+   * ⚠️ 同一缺陷在 `zcode`（上游新增的第 11 个 provider）上**又犯过一次** ——
+   * 且当时全套单测仍全绿：因为本用例是**手写清单**，只能证明「登记过的能恢复」，
+   * 无法发现「新 provider 没登记」。根因级的保险见下一条用例。
+   *
    * ⚠️ 上一条用例只覆盖 `buddy` 与 `codearts`，正是这个覆盖缺口让缺陷溜过。
-   * 本用例按 `jet-hub-rpc.ts` 的 `account.create` 前缀规则逐个断言，
-   * **新增 provider 时若忘记登记，这里会红**。
+   * 本用例按 `jet-hub-rpc.ts` 的 `account.create` 前缀规则逐个断言。
    */
-  it('十个 provider 的账号 ref 全部可恢复（新增 provider 必须同步登记）', () => {
+  it('十一个 provider 的账号 ref 全部可恢复（新增 provider 必须同步登记）', () => {
     const cases: Array<[string, string]> = [
       ['CODEARTS_ACCOUNT_AAAAAA', 'codearts'],
       ['BUDDY_ACCOUNT_BBBBBB', 'buddy'],
@@ -273,6 +276,7 @@ describe('文件后端（FileStore）', () => {
       ['CLINE_ACCOUNT_222222', 'cline'],
       ['LOOMY_ACCOUNT_333333', 'loomy'],
       ['RACCOON_ACCOUNT_444444', 'raccoon'],
+      ['ZCODE_ACCOUNT_555555', 'zcode'],
     ]
     writeFileSync(
       join(dir, '.credentials.yaml'),
@@ -282,6 +286,41 @@ describe('文件后端（FileStore）', () => {
 
     const recovered = createJetHubStore(makeCtx(undefined)).load()?.accounts ?? []
     expect(recovered.map(a => [a.credentialRef, a.provider])).toEqual(cases)
+  })
+
+  /**
+   * 回归（**根因级保险**）：恢复表必须覆盖客户端 `PROVIDERS` 的每一个 provider。
+   *
+   * 上一条用例的清单是**人手维护**的，所以「上游新增 provider 而本表没跟上」
+   * 这种缺陷它**测不出来** —— zcode 正是如此漏掉的：合并上游新增 ZCode 后
+   * 全套单测仍然全绿，而 `ZCODE_ACCOUNT_*` 的账号在 `state.json` 缺失时
+   * 会静默消失（凭据还在 `.credentials.yaml`，只是索引建不出来）。
+   *
+   * 故本用例从**客户端唯一的 provider 清单**（`plugin-src/client/jet-hub.js`
+   * 的 `PROVIDERS`，与 `credits-capabilities.spec.ts` 用同一套派生方式）
+   * 取 id，逐个构造 `{ID}_ACCOUNT_{HEX}` 并断言全部可恢复 —— 上游再加
+   * provider 而忘记同步本表时，这里会红。
+   */
+  it('恢复表覆盖客户端 PROVIDERS 的全部 provider（从真实清单派生）', () => {
+    // ⚠️ 用 `import.meta.url` 拼路径（不引 `dirname` / `fileURLToPath`）：
+    // 本文件的 import 区会被上游改动，少一处依赖就少一处合并冲突面。
+    const source = readFileSync(new URL('../../plugin-src/client/jet-hub.js', import.meta.url), 'utf8')
+    const providerIds = [...source.matchAll(/\{\s*id:\s*'([a-z]+)',\s*label:/g)].map((m) => m[1]!)
+    expect(providerIds.length).toBeGreaterThan(0)
+
+    const refs = providerIds.map(
+      (id, index) => `${id.toUpperCase()}_ACCOUNT_${(index + 1).toString(16).toUpperCase().padStart(6, '0')}`,
+    )
+    writeFileSync(
+      join(dir, '.credentials.yaml'),
+      ['refs:', ...refs.map((ref) => `  ${ref}: '{}'`), 'records: {}'].join('\n'),
+      'utf-8',
+    )
+
+    const recovered = createJetHubStore(makeCtx(undefined)).load()?.accounts ?? []
+    expect(recovered.map(a => [a.provider, a.credentialRef])).toEqual(
+      providerIds.map((id, index) => [id, refs[index]!]),
+    )
   })
 
   /**
