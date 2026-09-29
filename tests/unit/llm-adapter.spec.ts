@@ -1,7 +1,9 @@
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it, vi } from 'vitest'
 import { credentialRef } from '@deepseek-ai/dsh-credentials'
-import { CHAT_API_BASE, CodeArtsAdapter, QUEUE_STATUS_BASE } from '../../src/llm-adapter.js'
+import {
+  CHAT_API_BASE, CodeArtsAdapter, QUEUE_STATUS_BASE, RATE_LIMIT_FALLBACK_MS,
+} from '../../src/llm-adapter.js'
 import { setBenefitMemoryCache } from '../../src/models.js'
 import type { CodeArtsCredential } from '../../src/types.js'
 
@@ -616,6 +618,102 @@ describe('CodeArtsAdapter', () => {
     await expect(async () => {
       for await (const _ of adapter.stream(streamOptions)) { /* drain */ }
     }).rejects.toMatchObject({ code: 'INVALID_REQUEST' })
+  })
+
+  /**
+   * 回归（行为级）：**空体 429** 在 CodeArts 换号入口必须换号并写入兜底标记。
+   *
+   * ## 真实缺陷
+   *
+   * 「账号池里明明还有可用账号，插件却直接报错、也不换号」—— 本可自愈的限流
+   * 变成硬失败。
+   *
+   * 该入口有两道**各自独立**的判据，必须同时带上 `response.status`：
+   *
+   * ```ts
+   * if (accountPool && isRateLimited(errorText, response.status)) {   // 外层
+   *   const parsed = parseRateLimitError(errorText, options.model)     // 内层
+   *   if (parsed) { ...写标记 + 换号 + continue... }
+   * }
+   * ```
+   *
+   * 只补外层、漏掉内层时（93e8aff 的状态），空体 429 的后果是：外层判真放行 →
+   * 内层因体为空（`JSON.parse('')` 抛错，且没有状态码可兜底）返回 `null` →
+   * `if (parsed)` 把**整块**（写标记 + 换号 + `continue`）一起跳过 → 最终按原
+   * 错误抛出（`codearts: model request failed with HTTP 429`）。
+   *
+   * ## 本用例的响应体刻意是**空串**
+   *
+   * 换任何含限流措辞的正文（如 `TM.00001042` /「请稍后重试」），外层与内层都会
+   * 命中，缺陷根本不会暴露 —— 那正是上一条 429 队列用例（openpangu）覆盖不到
+   * 它的原因：那条用例的正文本身就能被判为排队/限流。
+   *
+   * ## ⚠️ 判据是「chat 请求逐个账号的凭据」而不是「fetch 调用次数」
+   *
+   * `fetchImpl.mock.calls.length > 1` 是**假断言**：缺陷路径（`if (parsed)` 被
+   * 跳过但外层已放行）会继续走到 `queryQueueStatus` 去探测排队状态端点，
+   * 那**也是一次 fetch** —— 于是该断言在缺陷下同样为真，永远抓不到本缺陷。
+   * 故这里刻意**不写**任何 fetch 次数断言，只断言真正区分修复前后的东西：
+   * chat 请求（`CHAT_API_BASE`）携带的凭据序列必须是 `['AK', 'AK2']`；
+   * 缺陷下它只有 `['AK']`（换号与写标记都没发生）。
+   */
+  it('空体 429 在 CodeArts 换号入口也必须换号并写入兜底标记（状态码要传进 parseRateLimitError）', async () => {
+    // 账号池替身：只实现 `CodeArtsAdapter.stream` 真正走到的三个方法。
+    // - findAccountIdByCredential：把首个凭据 AK 归属到 acct-1（决定写标记的账号）；
+    // - getAvailableAccount：返回**另一个**账号 acct-2 及其凭据 AK2；
+    // - updateModelRateLimit：记录标记，供断言兜底时长。
+    const marked: Array<{ accountId: string; modelId: string; resetAtMs: number }> = []
+    const pool = {
+      findAccountIdByCredential: async (provider: string, identity: string) =>
+        (provider === 'codearts' && identity === 'AK' ? 'acct-1' : ''),
+      getAvailableAccount: async () => ({
+        entry: { id: 'acct-2' },
+        credential: {
+          access_key_id: 'AK2', secret_access_key: 'SK2', security_token: 'ST2',
+          expires_at: '2099-01-01T00:00:00Z',
+        },
+      }),
+      updateModelRateLimit: async (accountId: string, modelId: string, resetAtMs: number) => {
+        marked.push({ accountId, modelId, resetAtMs })
+      },
+    }
+
+    // 只记录 **chat/completions** 请求的凭据（按 Authorization 里的 Access=<AK> 区分账号）；
+    // 排队状态端点的探测请求走的是另一个 base，不参与统计（见用例注释：次数断言是假断言）。
+    const chatKeys: string[] = []
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const headers = new Headers(init?.headers)
+      const key = /Access=([^,\s]+)/.exec(headers.get('Authorization') ?? '')?.[1] ?? ''
+      if (String(input).startsWith(CHAT_API_BASE)) chatKeys.push(key)
+      if (key === 'AK2') {
+        // 换号后成功：SSE 形状照抄本文件既有的成功用例。
+        return new Response(
+          'data: {"choices":[{"delta":{"content":"admitted-ok"}}]}\n\ndata: [DONE]\n\n',
+          { status: 200, headers: { 'content-type': 'text/event-stream' } },
+        )
+      }
+      // 首个账号返回**空体 429**：没有任何可识别文案，只剩状态码可判。
+      return new Response('', { status: 429 })
+    })
+
+    const adapter = makeAdapter({ fetchImpl, accountPool: pool })
+    const texts: string[] = []
+    for await (const chunk of adapter.stream(streamOptions)) {
+      if (chunk.type === 'text-delta') texts.push(chunk.text)
+    }
+
+    // ① **核心断言**：chat 请求逐个账号的凭据序列是 ['AK','AK2'] —— 换号确实发生了。
+    //    缺陷下这里只有 ['AK']（内层 null → 整块被跳过 → 抛原始 429）。
+    expect(chatKeys).toEqual(['AK', 'AK2'])
+    // ② 失败账号被写入限流标记；空体无时刻可解析 → 必须是兜底时长（≈ 1 小时）。
+    //    这是 UI「限额重置」徽章与「重测 / 重置」人工解禁的唯一依据。
+    expect(marked.map(entry => entry.accountId)).toEqual(['acct-1'])
+    expect(marked[0]!.modelId).toBe((streamOptions as { model: string }).model)
+    const fallbackDelta = marked[0]!.resetAtMs - Date.now()
+    expect(fallbackDelta).toBeGreaterThan(RATE_LIMIT_FALLBACK_MS - 60_000)
+    expect(fallbackDelta).toBeLessThanOrEqual(RATE_LIMIT_FALLBACK_MS)
+    // ③ 最终拿到内容，而不是把 429 抛给用户。
+    expect(texts).toEqual(['admitted-ok'])
   })
 
   it('translates tool_calls deltas into tool-call blocks so the harness can run them', async () => {

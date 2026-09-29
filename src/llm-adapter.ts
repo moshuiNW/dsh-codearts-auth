@@ -1017,7 +1017,13 @@ export class CodeArtsAdapter extends LlmAdapter {
         // ⚠️ 必须传 `response.status`：空体 429 时只看正文会判为非限流，
         // 整段换号逻辑被跳过（见 isRateLimited 的说明）。
         if (this.options.accountPool && isRateLimited(errorText, response.status)) {
-          const parsed = parseRateLimitError(errorText, options.model)
+          // ⚠️ 状态码必须传到 `parseRateLimitError` —— **与上面外层判据同源**。
+          // 空体 429 时 `isRateLimited` 因状态码判真而放行进来，但只按正文解析的
+          // `parseRateLimitError` 返回 `null`，下面的 `if (parsed)` 会把**整块**
+          // （写限流标记 + 换号 + `continue`）一起跳过：既不换号、也不落标记，
+          // 最终按原错误抛出 —— 「空体 429 在 CodeArts 上依旧不自愈」。
+          // 该入口有两道**各自独立**的判据，必须同时带上 `response.status`。
+          const parsed = parseRateLimitError(errorText, options.model, response.status)
           if (parsed) {
             if (currentAccountId) {
               await this.options.accountPool.updateModelRateLimit(
@@ -1879,11 +1885,38 @@ export function isRateLimited(body: string, status?: number): boolean {
  */
 const RESET_TIME_PATTERN = /(?:将在|reset at)\s+([\d-]+\s+[\d:]+)\s+(UTC[+-]\d+(?::\d+)?)/i
 
-/** 从限流错误中提取重置时间 */
+/**
+ * 限流文案里解析不出重置时刻时的**兜底时长**（1 小时）。
+ *
+ * 为什么需要兜底而不是「解析不到就不记标记」：网关 / CDN 返回的 429 常常既没有
+ * 重置时间、甚至**没有响应体**，而标记是 UI「限额重置」徽章与「重测 / 重置」
+ * 两条人工解禁路径的**唯一**依据 —— 静默跳过记录会让用户既看不到限流、也无从操作。
+ *
+ * ⚠️ 1 小时是**快照式**兜底（标记可被重测刷新），与 `BUDDY_POLICY_BLOCK_COOLDOWN_MS`
+ * 的 30 分钟**语义不同**（那是「安全策略拦截」的本地冷却，报文里根本没有时间字段），
+ * 也与 Qoder「按自然日 24:00」不同（那是按日的额度结算）。三者不要合并成一个常量。
+ *
+ * 导出是给 `buddy-adapter` 用的：它需要在**没拿到可解析体**时也能写出标记，
+ * 且必须与这里 `parseRateLimitError` 的兜底**同值**，否则两处口径会漂。
+ */
+export const RATE_LIMIT_FALLBACK_MS = 3_600_000
+
+/**
+ * 从限流错误中提取重置时间；体里没有时间时返回 {@link RATE_LIMIT_FALLBACK_MS} 兜底。
+ *
+ * @param status - HTTP 状态码（可选）。为 `429` 时即使**体为空、或无任何可识别文案**
+ *   也按兜底时长返回一条，避免调用方「识别出限流却没有标记可写」（见
+ *   {@link RATE_LIMIT_FALLBACK_MS} 的说明）。
+ */
 export function parseRateLimitError(
   body: string,
   currentModel: string,
+  status?: number,
 ): { modelId: string; resetTimeMs: number } | null {
+  const fallback = (): { modelId: string; resetTimeMs: number } => ({
+    modelId: currentModel,
+    resetTimeMs: Date.now() + RATE_LIMIT_FALLBACK_MS,
+  })
   try {
     const data = JSON.parse(body) as Record<string, unknown>
     const msg = typeof data.msg === 'string' ? data.msg : ''
@@ -1896,12 +1929,12 @@ export function parseRateLimitError(
       }
     }
     // 标准 OpenAI 429 格式，或带业务码但文案无法解析出时间
-    if (isRateLimited(body)) {
-      // fallback: 1小时后重试
-      return { modelId: currentModel, resetTimeMs: Date.now() + 3_600_000 }
+    if (isRateLimited(body, status)) {
+      return fallback()
     }
     return null
   } catch {
-    return null
+    // 非 JSON（空体、纯文本、CDN 的 HTML 错误页）：只剩状态码可判。
+    return status === 429 ? fallback() : null
   }
 }

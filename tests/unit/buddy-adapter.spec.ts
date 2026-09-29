@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest'
 import {
   CHAT_API_BASE, BuddyAdapter, DEFAULT_MODEL, policyBlockResetAtMs, registerBuddyLlm,
 } from '../../src/buddy-adapter.js'
+import { RATE_LIMIT_FALLBACK_MS } from '../../src/llm-adapter.js'
 import type { BuddyCredential, BuddyRemoteModel } from '../../src/buddy.js'
 import { CODEBUDDY, WORKBUDDY, type BuddyProduct } from '../../src/product.js'
 
@@ -1696,7 +1697,7 @@ describe('BuddyAdapter 账号池限流切换', () => {
   })
 
   /**
-   * 回归：**空体 429** 必须同样触发换号。
+   * 回归：**空体 429** 必须同样触发换号，**并写入限流标记**。
    *
    * 真实缺陷：`isRateLimited` 原先只接收响应体，服务端（网关 / CDN / 限流
    * 中间件）返回**空体** 429 时结构化 code 与文案判据双双不命中 → 返回 false
@@ -1706,6 +1707,11 @@ describe('BuddyAdapter 账号池限流切换', () => {
    *
    * ⚠️ 本用例的响应体刻意为空串 —— 若传任何含限流措辞的正文，缺陷就不会
    * 暴露（那正是上一条用例无法覆盖它的原因）。
+   *
+   * ⚠️ 落标记的判据是**独立的一条缺陷**（93e8aff 未覆盖）：空体 429 没有 `msg`
+   * 可解析，`parseRateLimitError` 返回 `null`，旧写法 `if (parsed !== null)` 于是
+   * 连标记都不写 —— 换号发生了、UI 却既不显示限流徽章、用户也无法用
+   * 「重测 / 重置」人工解禁。故本用例断言 `recorded` 不为空且走兜底时长。
    */
   it('空体 429 也触发换号（状态码兜底，不只认正文）', async () => {
     const pool = makePool(
@@ -1739,6 +1745,13 @@ describe('BuddyAdapter 账号池限流切换', () => {
     // 核心断言：换号确实发生了（修复前这里只有 ['AT1']，然后直接抛错）
     expect(sentTokens).toEqual(['AT1', 'AT2'])
     expect(chunks.some((c) => c.type === 'text-delta' && c.text === 'ok')).toBe(true)
+    // 关键断言：失败账号被写入限流标记（空体无时刻可解析 → 走兜底时长），
+    // 否则 UI 既不显示限流徽章、用户也无法用「重测 / 重置」人工解禁。
+    expect(pool.recorded.map((r) => r.accountId)).toEqual(['acct-1'])
+    expect(pool.recorded[0]!.modelId).toBe(DEFAULT_MODEL)
+    const delta = pool.recorded[0]!.resetAtMs - Date.now()
+    expect(delta).toBeGreaterThan(RATE_LIMIT_FALLBACK_MS - 60_000)
+    expect(delta).toBeLessThanOrEqual(RATE_LIMIT_FALLBACK_MS)
   })
 
   it('全部账号限流后才报错，且错误码为不可重试的 QUOTA_EXCEEDED', async () => {

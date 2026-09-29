@@ -19,7 +19,7 @@ import {
 } from '@deepseek-ai/dsh-llm'
 import { AccountPool, providerCatalogVisible } from './account-pool.js'
 import { settingsNamespaceFor } from './settings-compat.js'
-import { isRateLimited, parseRateLimitError } from './llm-adapter.js'
+import { RATE_LIMIT_FALLBACK_MS, isRateLimited, parseRateLimitError } from './llm-adapter.js'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
 import {
@@ -1482,17 +1482,35 @@ export class BuddyAdapter extends LlmAdapter {
         let sawContentRejection = false
         let contentRejectionStatus = 0
         let contentRejectionBody = ''
+        /**
+         * 已经写过限流标记的账号：避免同一个账号被重复记账（换号途中可能取回它）。
+         * 标记是「账号 × 模型」的快照，写两次没有意义，日志也会重复。
+         */
+        const rateLimitMarked = new Set<string>()
 
         for (;;) {
-          // 记录当前账号在该模型上的限流重置时间（UI 据此展示限流标记）。
+          // 先给**当前**账号记限流标记（UI 据「限额重置」徽章展示；它也是
+          // 「重测 / 重置」两条人工解禁路径的唯一依据）。
           //
-          // 注意 `errorText` 在换号后可能是 11140（非限流）响应体，此时
-          // `parseRateLimitError` 返回 `null`：只跳过记录即可，**不能**据此
-          // break（那正是上面「换号提前中断」缺陷的另一半成因）。
-          const parsed = parseRateLimitError(errorText, options.model)
-          if (parsed !== null && currentAccountId) {
+          // ⚠️ 判据从「解析出重置时间」改为 `isRateLimited(errorText, response.status)`：
+          // 空体 429 根本没有 `msg` 可解析（`parseRateLimitError` 给兜底时长，
+          // 不需要在这里区分），而**只要判为限流就必须留下标记** —— 否则用户
+          // 既看不到限流徽章、也无法手动解禁。真实缺陷复现：空体 429 时旧写法
+          // 连标记都不写（`recorded` 为空），而换号却发生了。
+          //
+          // ⚠️ `parseRateLimitError` 仍然优先：它能把**服务端声明的**真实重置
+          // 时刻抠出来（有就绝不用兜底的 1 小时）。换号后 `errorText` 可能是
+          // 11140（非限流）响应体 —— 那种情况下面①的分支会先 continue，走不到这里；
+          // 若走得到，`isRateLimited` 判假 → 只跳过记录，**不能**据此 break
+          //（那正是上面「换号提前中断」缺陷的另一半成因）。
+          if (currentAccountId !== '' && isRateLimited(errorText, response.status)
+            && !rateLimitMarked.has(currentAccountId)) {
+            rateLimitMarked.add(currentAccountId)
+            const parsed = parseRateLimitError(errorText, options.model, response.status)
             await this.options.accountPool.updateModelRateLimit(
-              currentAccountId, parsed.modelId, parsed.resetTimeMs,
+              currentAccountId,
+              parsed?.modelId ?? options.model,
+              parsed?.resetTimeMs ?? Date.now() + RATE_LIMIT_FALLBACK_MS,
             )
           }
           // 取下一个未尝试过的可用账号（同样按本产品 id 过滤，否则 WorkBuddy

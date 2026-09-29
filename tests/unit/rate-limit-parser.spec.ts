@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { isRateLimited, parseRateLimitError } from '../../src/llm-adapter.js'
+import { RATE_LIMIT_FALLBACK_MS, isRateLimited, parseRateLimitError } from '../../src/llm-adapter.js'
 
 /**
  * 限流判定的中英文双语契约。
@@ -134,5 +134,44 @@ describe('rate limit parser', () => {
   it('429 之外仍保留既有文案兜底（状态码不是唯一判据）', () => {
     expect(isRateLimited('usage exceeds frequency limit', 200)).toBe(true)
     expect(isRateLimited('{"code":6004}', 400)).toBe(true)
+  })
+
+  // 上面那批用例只覆盖了 `isRateLimited`（「判不判为限流」）。下面这条补的是
+  // **标记侧**的缺口：适配器写 `modelRateLimits` 依赖 `parseRateLimitError`
+  // 返回非 null，而它是**唯一**依据 —— 解析不到就返回 null 会让 UI 既看不到
+  // 限流徽章、也没有「重测 / 重置」这条人工解禁路径。
+  // ⚠️ 不重复上面已有的 `isRateLimited` 断言，这里只断言标记。
+
+  it('无法识别正文的 429 也必须返回兜底标记（≈ now + 1 小时）', () => {
+    const bodies = [
+      '',                                     // 完全空体（真实缺陷的形态）
+      '   ',                                  // 仅空白
+      '<html><body>429</body></html>',        // CDN 错误页：无「too many requests」字样
+      '{"requestId":"abc"}',                  // 有 JSON 但无 code/msg，解析不出时刻
+    ]
+    for (const body of bodies) {
+      const label = JSON.stringify(body)
+      const result = parseRateLimitError(body, 'm', 429)
+      expect(result, `429 应有兜底标记: ${label}`).not.toBeNull()
+      expect(result!.modelId, `标记应落在当前模型: ${label}`).toBe('m')
+      // 体里没有服务端声明的时刻 → 走 RATE_LIMIT_FALLBACK_MS 兜底（1 小时）。
+      const delta = result!.resetTimeMs - Date.now()
+      expect(delta, `兜底时长应≈ RATE_LIMIT_FALLBACK_MS: ${label}`)
+        .toBeGreaterThan(RATE_LIMIT_FALLBACK_MS - 60_000)
+      expect(delta, `兜底时长应≈ RATE_LIMIT_FALLBACK_MS: ${label}`)
+        .toBeLessThanOrEqual(RATE_LIMIT_FALLBACK_MS)
+    }
+    // 反向锁定：同一批正文在**没有状态码**时仍必须返回 null —— 兜底只由 429
+    // 触发，绝不能退化成「解析不出来就当限流」（那会把 400/404 也记成限流）。
+    for (const body of bodies) {
+      expect(parseRateLimitError(body, 'm'), `无状态码不应有标记: ${JSON.stringify(body)}`).toBeNull()
+    }
+  })
+
+  it('有服务端声明的重置时刻时优先用它，不用兜底时长', () => {
+    // 兜底只在「体里没有时刻」时生效；有真实时刻必须原样透出（否则 UI 显示错误时间）。
+    const result = parseRateLimitError('{"code":6004,"msg":"将在 2030-01-02 03:04:05 UTC+8 重置"}', 'm', 429)
+    expect(result!.resetTimeMs).toBe(Date.parse('2030-01-02 03:04:05 UTC+8'))
+    expect(result!.resetTimeMs).not.toBe(Date.now() + RATE_LIMIT_FALLBACK_MS)
   })
 })
