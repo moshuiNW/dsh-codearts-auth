@@ -1,5 +1,57 @@
 # dsh-codearts-auth
 
+> ## ⚠️ 本仓库已归档（ARCHIVED）
+>
+> **请改用上游项目：[iJetLi/deepseek-harness-codearts](https://gitee.com/iJetLi/deepseek-harness-codearts)**
+>
+> 本仓库已停止维护并归档为只读。上游是**严格超集**，且已支持国际站 ——
+> 迁移不会丢失任何功能，反而会得到更多。
+>
+> ### 为什么迁移
+>
+> | | 本仓库 | 上游 |
+> |---|---|---|
+> | provider 数量 | 11 | **12**（多出 `minimax`） |
+> | 国际站支持 | ✅ | ✅ |
+> | 维护状态 | 已归档（只读） | 活跃维护 |
+>
+> 上游包含本仓库的全部 provider：`buddy`、`workbuddy`、`lobsterai`、`qoder`、
+> `qodercn`、`trae`、`cline`、`loomy`、`raccoon`、`zcode`、`codearts`，
+> 另有本仓库没有的 `minimax`（MiniMax Code 中国版）。
+>
+> ⚠️ 本仓库曾修复的几个缺陷（空体 429 不触发换号、账号在 `state.json` 丢失后
+> 静默消失）**是否已并入上游未经核实** —— 上游 README 中未见相关记载。
+> 若你正依赖这些修复，请先在上游实测确认，再决定是否切换。
+>
+> ### 如何迁移
+>
+> 1. 在 Jet Hub 中记录你已登录的账号。凭据本身存在 `~/.dsh/.credentials.yaml`，
+>    **卸载插件不会删除凭据**，装上游后重新登录即可；
+> 2. 卸载本插件（`dsh plugin` 把参数**原样转发给 pnpm**，故命令与 pnpm 一致；
+>    把 `<name>` 换成你的 profile 名）：
+>
+>    ```sh
+>    dsh plugin --profile <name> remove dsh-codearts-auth
+>    ```
+>
+>    若提示找不到该依赖（不同安装方式下依赖名可能不同），用
+>    `dsh plugin --profile <name> list` 看实际名称，或直接编辑 profile 的
+>    `package.json` 移除后重跑安装；
+> 3. 安装上游：
+>
+>    ```sh
+>    dsh plugin --profile <name> add "https://gitee.com/iJetLi/deepseek-harness-codearts.git"
+>    ```
+>
+>    ⚠️ **这一步别指望一次成功** —— pnpm 10/11 会拦截依赖的构建脚本，且**两代
+>    要求的放行键写法不兼容**，写错就装不上。上游 README 的「安装」章节给了完整
+>    步骤（先跑一次让 pnpm 打印它期望的键，再按报错类型选写法），**请直接照它做**。
+>
+> ### 本仓库的历史内容
+>
+> 下方的 README 正文、源码与提交历史**保持原样**，仅作存档参考。
+> ⚠️ **其中的安装命令指向本仓库，归档后已不可用**；新增开发请基于上游进行。
+
 deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走新式 IAM OAuth
 （portal `/authorize` 授权 → 本地 `/oauth/callback` 回调 → STS token 端点换取含
 `refresh_token` 的凭据），到期前静默续期，无需再次打开浏览器；旧 ticket 流程保留
@@ -34,6 +86,11 @@ deepseek-harness 插件：执行 CodeArts（华为云）登录流程，默认走
 见 [模型列表开关](#模型列表开关黑名单)。
 
 ## 安装
+
+> ⚠️ **本节已过时**：以下命令指向**本仓库**，而本仓库已归档（只读），
+> 安装会失败或停留在旧版本。**请改用上游**
+> [iJetLi/deepseek-harness-codearts](https://gitee.com/iJetLi/deepseek-harness-codearts)，
+> 安装步骤见其 README 的「安装」章节。下方内容仅作存档。
 
 该包尚未发布到 npm registry。提供两种安装方式：**git 仓库安装**（推荐，自动拉取
 并构建）和**源码目录安装**（本地开发联调）。
